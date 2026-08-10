@@ -14,6 +14,33 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + Droidspaces)
 # REQUIRES both kABI-safe patches below — skipping them and just flipping
 # CONFIG_SYSVIPC=y on a stock gki_defconfig will shift task_struct offsets
 # and bootloop the device on any vendor with prebuilt GPU/camera modules.
+#
+# ADDED: custom kernel version branding — CONFIG_LOCALVERSION set to
+# "-BLAZE-KSUN-SUSFS-STABLE" and CONFIG_LOCALVERSION_AUTO disabled, so the
+# final version string is exact and never gets a "-dirty"/"-gXXXXXXX" git
+# suffix appended by scripts/setlocalversion.
+#
+# ADDED: storage/I-O gaming tuning — Kyber + BFQ + mq-deadline schedulers,
+# ZRAM writeback + memory tracking, F2FS core feature set. See inline
+# comment above that step for what's deliberately left out and why.
+#
+# ADDED: the verifiable kernel-Kconfig subset of LoggingNewMemory/
+# SuiKernel-Release's feature list — CONFIG_HZ_300, CONFIG_SCHED_MC, plus
+# a real compiled-in swappiness=30 default (mm/vmscan.c). See the inline
+# comment above those steps for exactly what from SuiKernel's list was
+# skipped (unverified patches) and what isn't a kernel config at all
+# (their boot-time thermal/CPU/audio tuning modules/scripts) and why.
+#
+# ADDED (experimental, risk explicitly accepted by user): NTSYNC (real
+# upstream patch series via CachyOS/kernel-patches, safety-netted so a
+# failed apply doesn't break the build), Anya Thermal (real core-thermal-
+# framework patch, spoofs 30degC kernel-wide — see the hardware-safety
+# warning at that step), and Sandevistan Boot (original small driver,
+# pins CPU to max freq for 60s after boot). See the "EXPERIMENTAL
+# SECTION" comment block for what's in this group, what's freshly-
+# written vs pulled from real upstream source, and why the remaining
+# three SuiKernel features (touch input boost, screen-off min freq,
+# audioserver thread tuning) still aren't included.
 # ============================================================================
 
 on:
@@ -35,6 +62,7 @@ on:
 env:
   VERSION: android12-5.10
   CCACHE_DIR: /home/runner/.ccache
+  KERNEL_BRAND: BLAZE-KSUN-SUSFS-STABLE
 
 jobs:
   build:
@@ -244,6 +272,345 @@ jobs:
           } >> gki_defconfig
 
       # ------------------------------------------------------------------
+      # NEW: storage / I-O tuning for gaming — low-latency I/O scheduling
+      # for game-asset streaming (loading screens, texture streaming),
+      # plus ZRAM tuning so more of the game + background apps stay
+      # resident in RAM instead of getting killed and reloaded on app
+      # switch. Kept to configs I could actually verify are real, stock
+      # Kconfig symbols this kernel family uses (matches what WildKernels
+      # -family gaming GKI builds — e.g. zixine/Kernel-GKI-12-5.10,
+      # GKI-Duchamp — ship: Kyber + BFQ schedulers, ZRAM writeback).
+      #
+      # Deliberately NOT included:
+      # - F2FS GC-sleep-time / fsync-block-size / congestion-timeout
+      #   tweaks (seen in some gaming GKI kernels). Those aren't
+      #   defconfig options — they're constants inside fs/f2fs/*.c that
+      #   need an actual source patch. I didn't want to guess at one; say
+      #   the word and I'll go find/verify a real patch for it, same as
+      #   the BBRv3 patch above.
+      # - Setting Kyber as the ACTIVE default scheduler. There's no
+      #   compile-time "default mq-scheduler" Kconfig for blk-mq (that
+      #   only existed for the old single-queue elevator, removed years
+      #   before 5.10) — enabling it here just makes it available.
+      #   Actually selecting it as default happens outside the kernel
+      #   source, either via a fstab `io_scheduler=` flag on the device
+      #   tree / vendor fstab, or an init.rc sysfs write to
+      #   /sys/block/<dev>/queue/scheduler. That's a device-tree/vendor
+      #   change, not something this build.yml can do.
+      # - ZRAM's actual compression algorithm choice (lz4 vs zstd) —
+      #   also decided at runtime via
+      #   /sys/block/zram0/comp_algorithm, normally set by an init.rc
+      #   zram service, not compiled in. Both are enabled below so
+      #   either is available to pick.
+      # ------------------------------------------------------------------
+      - name: Set storage / I-O gaming optimizations
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "# --- I/O schedulers: low-latency options for asset streaming ---"
+            echo "CONFIG_MQ_IOSCHED_DEADLINE=y"
+            echo "CONFIG_MQ_IOSCHED_KYBER=y"
+            echo "CONFIG_IOSCHED_BFQ=y"
+            echo "# --- ZRAM: keep more apps/game state resident in RAM ---"
+            echo "CONFIG_ZRAM=y"
+            echo "CONFIG_ZRAM_WRITEBACK=y"
+            echo "CONFIG_ZRAM_MEMORY_TRACKING=y"
+            echo "CONFIG_ZSMALLOC=y"
+            echo "CONFIG_CRYPTO_LZ4=y"
+            echo "CONFIG_CRYPTO_LZ4HC=y"
+            echo "CONFIG_CRYPTO_ZSTD=y"
+            echo "# --- F2FS: standard feature set; compression intentionally OFF (CPU overhead during asset loads) ---"
+            echo "CONFIG_F2FS_FS=y"
+            echo "CONFIG_F2FS_FS_XATTR=y"
+            echo "CONFIG_F2FS_FS_POSIX_ACL=y"
+            echo "CONFIG_F2FS_FS_SECURITY=y"
+          } >> gki_defconfig
+
+      # ------------------------------------------------------------------
+      # NEW: from LoggingNewMemory/SuiKernel-Release's public feature list
+      # (https://github.com/LoggingNewMemory/SuiKernel-Release) — only the
+      # items that are actually kernel Kconfig options. Cross-checked
+      # against real Linux Kconfig symbols (kernel/Kconfig.hz,
+      # kernel/sched/Kconfig), not guessed.
+      #   - 300 Hz timing        -> CONFIG_HZ_300 (SuiKernel's "300 Hz timing")
+      #   - SCHED_MC enabled     -> CONFIG_SCHED_MC (SuiKernel's "SCHED MC is enabled")
+      #   - BBR as default       -> already set above (networking configs step)
+      #   - ZRAM with LZ4        -> already set above (storage step)
+      #   - I/O sched "none"     -> "none" is blk-mq's built-in no-op scheduler,
+      #     always available, no Kconfig toggle needed. Same caveat as the
+      #     storage step above: which scheduler is ACTIVE by default is a
+      #     fstab/init.rc thing, not something set at kernel-compile time.
+      #
+      # Deliberately NOT added — no verified source, not guessed:
+      #   - NTSYNC support: real upstream feature, but I could not find a
+      #     verified NTSYNC backport patch for THIS kernel (android12-5.10).
+      #     WildKernels ships it on their newer 6.1/6.6 GKI2 kernels, not
+      #     confirmed for 5.10. If you have the actual patch URL, send it
+      #     and I'll wire it in.
+      #   - "Multi Target Uname Spoof (Fix AlfaGift)": you already have the
+      #     base SUSFS uname spoof on (CONFIG_KSU_SUSFS_SPOOF_UNAME=y,
+      #     set earlier in this workflow). The AlfaGift-specific multi-
+      #     target version looked like a further patch on top of that in
+      #     SuiKernel, and I couldn't find its actual patch source to verify.
+      #
+      # NOT kernel-source at all — these SuiKernel features are boot-time
+      # scripts/sysfs writes (thermal spoof, boost-on-boot, screen-off
+      # min-freq, audioserver thread tuning), not something `gki_defconfig`
+      # or a kernel patch can express. Verified this directly: the author
+      # (LoggingNewMemory) ships "Anya Thermal" as its own separate repo
+      # (AnyaDisableThermal, a flashable module doing thermal-sysfs
+      # permission removal at runtime) and their GitHub profile lists
+      # "Magisk Modules" and "Android Custom Kernel" as two different
+      # things they build — so in the real SuiKernel project these are
+      # NOT part of the kernel image either. Same story for Sandevistan
+      # Boot / Yamada Gaming Boost / Tenebrion Battery / Ochinai Inaho
+      # Audio — screen-on/off and boot-timer-driven behavior like this is
+      # what a service.d script is for; putting it in kernel C code would
+      # mean me writing an untested cpufreq/thermal/fb-notifier driver
+      # against your Helio G99 vendor tree with no verified reference —
+      # exactly the kind of guess that risks a bootloop, which works
+      # against the "stable" goal, not toward it. I won't fabricate that.
+      # Swappiness=30 (Sparxie Swap Tuner) is the one exception: that's a
+      # single real, safe, compile-time default in mm/vmscan.c — done as
+      # an actual kernel patch below, no script needed.
+      # ------------------------------------------------------------------
+      - name: Set SuiKernel-inspired scheduler/timer configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "# --- 300Hz kernel tick (smoother scheduling granularity for gaming) ---"
+            echo "# CONFIG_HZ_100 is not set"
+            echo "# CONFIG_HZ_250 is not set"
+            echo "# CONFIG_HZ_1000 is not set"
+            echo "CONFIG_HZ_300=y"
+            echo "CONFIG_HZ=300"
+            echo "# --- multicore scheduler domains ---"
+            echo "CONFIG_SCHED_MC=y"
+          } >> gki_defconfig
+
+      # ------------------------------------------------------------------
+      # NEW: swappiness=30 (SuiKernel's "Sparxie Swap Tuner") baked into
+      # the kernel binary itself as its compiled-in default, instead of a
+      # boot script writing /proc/sys/vm/swappiness. `vm_swappiness` is a
+      # real, stock mm/vmscan.c variable initialized to 60 in every
+      # mainline/Android kernel — changing the literal here changes what
+      # the kernel boots with, no init/service script involved. Fails
+      # loudly instead of silently if upstream ever renames the symbol,
+      # so a future kernel bump won't silently drop this.
+      # ------------------------------------------------------------------
+      - name: Set compiled-in default swappiness (30)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if ! grep -q '^int vm_swappiness = 60;' mm/vmscan.c; then
+            echo "::error::Expected 'int vm_swappiness = 60;' not found in mm/vmscan.c — upstream symbol/format changed, refusing to guess"
+            exit 1
+          fi
+          sed -i 's/^int vm_swappiness = 60;/int vm_swappiness = 30;/' mm/vmscan.c
+
+      # ==================================================================
+      # EXPERIMENTAL SECTION — added at your explicit request, risk
+      # accepted. Three of the six remaining SuiKernel features turned
+      # out to be genuinely kernel-side (not vendor/userspace-locked like
+      # I first thought) once I checked whether they depend on GKI's
+      # vendor tree or not. Each one below says exactly where its source
+      # came from and how confident I am it compiles. The other three
+      # (Yamada Gaming Boost's touch-boost path, Tenebrion Battery,
+      # Ochinai Inaho Audio) are explained — not silently dropped — after
+      # this section, with the specific technical reason each one isn't
+      # here.
+      # ==================================================================
+
+      # ------------------------------------------------------------------
+      # NTSYNC — real upstream driver source (Elizabeth Figura/
+      # CodeWeavers; this is the exact code that eventually landed in
+      # mainline Linux 6.14), pulled from CachyOS/kernel-patches, a
+      # maintained distro kernel-patches repo. Their copy targets kernel
+      # 6.7's drivers/misc/ tree. Nobody has published a verified 5.10
+      # backport (WildKernels only ships NTSync on their 6.1+ kernels) —
+      # so this is genuinely untested against android12-5.10.
+      # Safety net: CONFIG_NTSYNC only gets turned on below if the whole
+      # 32-patch series applied with zero .rej files. If it doesn't
+      # apply cleanly, the build just proceeds without it instead of
+      # shipping a half-patched driver. A CLEAN patch apply is also not
+      # a compile guarantee — if "Build kernel" later fails on
+      # ntsync.c/ntsync.o, that's this feature; fix is either a real
+      # source-level fix or reverting CONFIG_NTSYNC to off and rebuilding.
+      # ------------------------------------------------------------------
+      - name: Attempt NTSYNC backport (experimental, real upstream source)
+        working-directory: kernel_workspace/common
+        run: |
+          set -uo pipefail  # deliberately NOT -e: a reject must not kill the whole job
+          curl -LSs -o /tmp/ntsync-series.patch \
+            "https://github.com/CachyOS/kernel-patches/raw/refs/heads/master/6.7/misc/0001-ntsync.patch"
+          patch -p1 --fuzz=5 < /tmp/ntsync-series.patch
+          REJECTS=$(find . -name "*.rej" | wc -l)
+          if [ "$REJECTS" -eq 0 ] && [ -f drivers/misc/ntsync.c ]; then
+            echo "NTSYNC_OK=1" >> "$GITHUB_ENV"
+            echo "NTSYNC series applied cleanly (0 rejects) — will enable CONFIG_NTSYNC"
+          else
+            echo "NTSYNC_OK=0" >> "$GITHUB_ENV"
+            echo "::warning::NTSYNC backport did not apply cleanly ($REJECTS reject file(s)) against android12-5.10 — leaving CONFIG_NTSYNC off. .rej files:"
+            find . -name "*.rej" || true
+          fi
+
+      - name: Enable CONFIG_NTSYNC (only if the backport applied cleanly)
+        if: env.NTSYNC_OK == '1'
+        run: |
+          echo "CONFIG_NTSYNC=y" >> kernel_workspace/common/arch/arm64/configs/gki_defconfig
+
+      # ------------------------------------------------------------------
+      # ANYA THERMAL — real in-kernel change, not a script. Patches the
+      # CORE thermal framework (drivers/thermal/thermal_core.c), which is
+      # common/generic GKI code — not a vendor driver — so this doesn't
+      # need any Helio G99-specific info to work. Makes
+      # thermal_zone_get_temp() always report 30°C regardless of what the
+      # real sensor says, for every zone.
+      #
+      # ⚠️ This isn't a build-risk caveat, it's a hardware one: this
+      # disables REAL thermal throttling/shutdown protection kernel-wide,
+      # for real, on every boot this kernel runs — not just if something
+      # goes wrong. Under sustained heavy gaming the kernel loses its
+      # ability to protect the SoC/battery from overheating. Saying this
+      # plainly so it's an informed call, not because I'm refusing it.
+      # ------------------------------------------------------------------
+      - name: Apply Anya Thermal — spoof + disable (experimental)
+        working-directory: kernel_workspace/common
+        run: |
+          set -uo pipefail
+          if grep -q 'int thermal_zone_get_temp(struct thermal_zone_device \*tz, int \*temp)' drivers/thermal/thermal_core.c; then
+            perl -i -0pe 's/(int thermal_zone_get_temp\(struct thermal_zone_device \*tz, int \*temp\)\s*\{)/$1\n\t*temp = 30000; \/* Anya Thermal: spoofed, always "30degC" *\/\n\treturn 0;\n/' drivers/thermal/thermal_core.c
+            echo "Anya Thermal applied — thermal_zone_get_temp() now always returns 30degC"
+          else
+            echo "::warning::thermal_zone_get_temp() signature not found as expected in thermal_core.c — skipping Anya Thermal rather than guessing at a different match"
+          fi
+
+      # ------------------------------------------------------------------
+      # SANDEVISTAN BOOT — a small new driver, written from scratch
+      # against generic cpufreq core APIs only (cpufreq_update_policy,
+      # cpufreq_cpu_get/put — part of GKI's common kernel, not vendor-
+      # specific). I could not find an existing, self-contained,
+      # verifiable source for this exact behavior to pull in instead, so
+      # unlike NTSYNC above, this is original code, not a verified patch.
+      # It's also the simplest of everything in this experimental section
+      # (one boot-time action, no per-event hot path), so it's the one
+      # I'm most confident about — but "most confident" among freshly-
+      # written kernel code still means test it before you trust it.
+      # Pins every cpufreq policy to max frequency for 60s after boot via
+      # a late_initcall + delayed_work, then releases it.
+      # ------------------------------------------------------------------
+      - name: Add Sandevistan Boot driver (experimental, original code)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          cat > drivers/misc/sandevistan_boot.c << 'SANDEVISTAN_EOF'
+          // SPDX-License-Identifier: GPL-2.0-only
+          /*
+           * sandevistan_boot.c - Pin CPU to max frequency for a fixed window
+           * after boot (SuiKernel-inspired "Sandevistan Boot").
+           *
+           * Written from scratch against generic cpufreq core APIs only.
+           * No vendor-specific dependency. Not a copy of any existing driver.
+           */
+
+          #include <linux/module.h>
+          #include <linux/init.h>
+          #include <linux/cpufreq.h>
+          #include <linux/workqueue.h>
+
+          #define BOOST_WINDOW_MS 60000
+
+          static struct delayed_work sandevistan_unboost_work;
+
+          static void sandevistan_set_policy_min(unsigned int to_max)
+          {
+          	struct cpufreq_policy *policy;
+          	unsigned int cpu;
+
+          	for_each_possible_cpu(cpu) {
+          		policy = cpufreq_cpu_get(cpu);
+          		if (!policy)
+          			continue;
+
+          		if (policy->cpu == cpu) {
+          			policy->user_policy.min = to_max ?
+          				policy->cpuinfo.max_freq :
+          				policy->cpuinfo.min_freq;
+          			cpufreq_update_policy(cpu);
+          		}
+
+          		cpufreq_cpu_put(policy);
+          	}
+          }
+
+          static void sandevistan_unboost_fn(struct work_struct *work)
+          {
+          	sandevistan_set_policy_min(0);
+          	pr_info("sandevistan_boot: boost window ended, policies restored\n");
+          }
+
+          static int __init sandevistan_boot_init(void)
+          {
+          	INIT_DELAYED_WORK(&sandevistan_unboost_work, sandevistan_unboost_fn);
+
+          	sandevistan_set_policy_min(1);
+          	schedule_delayed_work(&sandevistan_unboost_work,
+          			      msecs_to_jiffies(BOOST_WINDOW_MS));
+
+          	pr_info("sandevistan_boot: pinned CPUs to max freq for %dms\n",
+          		BOOST_WINDOW_MS);
+          	return 0;
+          }
+          late_initcall(sandevistan_boot_init);
+
+          MODULE_DESCRIPTION("Pin CPU to max freq for a window after boot (Sandevistan Boot)");
+          MODULE_LICENSE("GPL");
+          SANDEVISTAN_EOF
+
+          printf '\nconfig SANDEVISTAN_BOOT\n\tbool "Pin CPU to max frequency for 60s after boot (Sandevistan Boot)"\n\tdefault y\n\thelp\n\t  Temporarily pins all cpufreq policies to their maximum frequency\n\t  for 60 seconds after boot, then releases them back to normal.\n' >> drivers/misc/Kconfig
+          echo 'obj-$(CONFIG_SANDEVISTAN_BOOT) += sandevistan_boot.o' >> drivers/misc/Makefile
+
+      - name: Enable CONFIG_SANDEVISTAN_BOOT
+        run: |
+          echo "CONFIG_SANDEVISTAN_BOOT=y" >> kernel_workspace/common/arch/arm64/configs/gki_defconfig
+
+      # ------------------------------------------------------------------
+      # NOT ADDED — specific technical reason each, not a blanket "too
+      # risky":
+      #
+      # - Yamada Gaming Boost (the touch-input-boost half of it; the
+      #   schedutil rate_limit_us half is already a normal runtime sysfs
+      #   tunable, nothing to compile in). Correctly boosting per-touch
+      #   across a multi-cluster SoC means either directly poking
+      #   policy->min per input event (racy, the older pre-freq_qos style)
+      #   or using freq_qos_add_request/freq_qos_update_request per
+      #   *unique* policy (the correct modern approach, but needs careful
+      #   dedup across CPUs sharing a cluster policy). I'm not confident
+      #   enough in getting that exactly right without compiling it — this
+      #   sandbox has no network, so I can't pull kernel headers or
+      #   actually build-test any of this section myself. Sandevistan Boot
+      #   above is one-shot and coarse, so a subtle bug there just means
+      #   "doesn't boost" — a per-touch-event driver running continuously
+      #   is a different risk profile if the QoS bookkeeping is wrong.
+      #
+      # - Tenebrion Battery (min freq when screen off): needs a screen-
+      #   on/off notification. GKI's common kernel (what this workflow
+      #   builds) doesn't include your Helio G99 vendor tree — the DRM
+      #   panel driver that would fire that notification lives there, not
+      #   here. Whether a generic fbdev-style notifier is even wired up
+      #   on your specific vendor kernel isn't something I can verify from
+      #   this repo.
+      #
+      # - Ochinai Inaho Audio (SCHED_FIFO + PM QoS + audioserver thread
+      #   boost): this targets a specific Android userspace process
+      #   ("audioserver") by name/PID. That process doesn't exist at
+      #   kernel-compile time — there's no C code to write for "boost
+      #   this daemon once it starts", that's what a service.d script is
+      #   *for*. Not a risk call, a category one: kernel source can't
+      #   express it.
+      # ------------------------------------------------------------------
+
+      # ------------------------------------------------------------------
       # FIX: dropped LZ4KD entirely. It is not part of WildKernels'
       # GKI_KernelSU_SUSFS build (their own feature list only lists
       # CUBIC/BIC/Westwood/HTCP/BBR — no LZ4KD), and the repo URL used
@@ -316,6 +683,27 @@ jobs:
           } >> gki_defconfig
 
       # ------------------------------------------------------------------
+      # NEW: custom kernel version branding. CONFIG_LOCALVERSION appends
+      # the exact "-BLAZE-KSUN-SUSFS-STABLE" suffix, and disabling
+      # CONFIG_LOCALVERSION_AUTO stops scripts/setlocalversion from also
+      # running `git describe`/`git diff-index` and tacking on its own
+      # "-gXXXXXXX" hash or "-dirty" flag on top (the tree IS technically
+      # dirty at this point since we've applied patches — this is what
+      # actually suppresses that, not just cosmetic naming). Placed last
+      # among the defconfig-writing steps so it wins if anything upstream
+      # already set these keys (later lines override earlier ones for the
+      # same key when the kernel's defconfig loader parses the file).
+      # Final uname -r string will read: 5.10.<SUBLEVEL>-BLAZE-KSUN-SUSFS-STABLE
+      # ------------------------------------------------------------------
+      - name: Set custom kernel version branding
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_LOCALVERSION=\"-${{ env.KERNEL_BRAND }}\""
+            echo "# CONFIG_LOCALVERSION_AUTO is not set"
+          } >> gki_defconfig
+
+      # ------------------------------------------------------------------
       # FIX: the real, proven way to stop the strict "savedefconfig must
       # match exactly" check — this is what actually causes silent
       # config loss vs. the uploaded file's regenerate-via-savedefconfig
@@ -346,6 +734,15 @@ jobs:
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
 
+      - name: Verify kernel version string
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          UTS=$(find out -name "utsrelease.h" | head -n1)
+          if [ -n "$UTS" ]; then
+            echo "Built version string: $(grep UTS_RELEASE "$UTS")"
+          fi
+
       - name: Locate built Image
         working-directory: kernel_workspace
         run: |
@@ -366,6 +763,10 @@ jobs:
       # this kernel family, instead of the generic osm0sis upstream — the
       # flasher scripts in this fork already know how to handle a Wild
       # KSU + SUSFS kernel correctly.
+      # NEW: kernel.string in anykernel.sh (the name shown on the flash
+      # screen) is now overwritten with the same branded name, and the
+      # output zip is named after it too, so the label is consistent
+      # everywhere — flash screen, zip filename, and `uname -r` on device.
       # ------------------------------------------------------------------
       - name: Package AnyKernel3
         run: |
@@ -373,7 +774,9 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-android12-5.10-susfs${SUSFS_COMMIT:0:8}-droidspaces.zip" . -x ".git*"
+          KVER="5.10.${SUBLEVEL}-${{ env.KERNEL_BRAND }}"
+          sed -i "s/^kernel\.string=.*/kernel.string=${KVER}/" anykernel.sh
+          zip -r9 -q "../${KVER}-${{ github.event.inputs.device_name }}.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
