@@ -18,11 +18,6 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 #    POSIX_MQUEUE patches; the risky configs are only enabled if both
 #    patches apply cleanly, to avoid a bootloop)
 #  - NTSync
-#  - Thermal spoof: patches thermal_zone_get_temp() in
-#    drivers/thermal/thermal_core.c so every zone reports a fixed
-#    30000 mC (30°C) to callers (sysfs/HAL/apps). Does not touch
-#    tz->ops->get_temp() itself, so real thermal throttling still
-#    works off the actual sensor value.
 #  - Custom kernel branding (-BLAZE-KSUNv1-STABLE version suffix)
 # ============================================================================
 
@@ -386,48 +381,6 @@ jobs:
             echo "CONFIG_TMPFS_XATTR=y"
           } >> gki_defconfig
 
-      - name: Add thermal spoof (report fixed 30°C to all zones)
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          # Patches thermal_zone_get_temp() — the single choke point every
-          # thermal zone read goes through on its way to sysfs
-          # (/sys/class/thermal/thermal_zoneN/temp) and the thermal HAL —
-          # so it reports a fixed 30000 mC (30°C) instead of the real
-          # sensor value. Deliberately does NOT touch tz->ops->get_temp()
-          # itself: that's the raw driver call that cooling
-          # devices/thermal trip points react to internally, so actual
-          # thermal throttling still functions on real sensor data. Only
-          # the value handed back to callers (userspace, HAL, apps) is
-          # spoofed.
-          python3 - << 'PYEOF'
-          import sys
-
-          path = "drivers/thermal/thermal_core.c"
-          with open(path, "r") as f:
-              src = f.read()
-
-          anchor = "ret = tz->ops->get_temp(tz, temp);"
-          if anchor not in src:
-              print("::warning::thermal_zone_get_temp() anchor not found in "
-                    "drivers/thermal/thermal_core.c — this kernel sublevel's "
-                    "source layout differs from what was expected. Thermal "
-                    "spoof NOT applied; real temps will be reported.")
-              sys.exit(0)
-
-          if "thermal spoof" in src:
-              print("Thermal spoof already present — skipping")
-              sys.exit(0)
-
-          spoof = anchor + "\n\tif (!ret)\n\t\t*temp = 30000; /* thermal spoof: fixed 30C */"
-          src = src.replace(anchor, spoof, 1)
-
-          with open(path, "w") as f:
-              f.write(src)
-
-          print("Thermal spoof applied: thermal_zone_get_temp() now forces 30000 mC (30°C) on success")
-          PYEOF
-
       - name: Apply custom kernel branding
         working-directory: kernel_workspace/common
         run: |
@@ -455,6 +408,29 @@ jobs:
           USE_CCACHE=1 \
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
+
+      - name: Verify CONFIG_USER_NS made it into the final .config
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          # gki_defconfig only carries our *requested* setting; the value that
+          # actually matters is whatever ended up in the .config the build
+          # produced, since a vendor/board fragment merged in later by
+          # build.sh can silently override it. Fail loudly here instead of
+          # finding out from a "CONFIG_USER_NS disabled" check on-device.
+          CFG=$(find out -name ".config" | head -n1)
+          if [ -z "$CFG" ]; then
+            echo "::error::Could not find a compiled .config under kernel_workspace/out to verify"
+            exit 1
+          fi
+          echo "Checking $CFG"
+          if grep -q '^CONFIG_USER_NS=y$' "$CFG"; then
+            echo "✓ CONFIG_USER_NS=y confirmed in final .config"
+          else
+            echo "::error::CONFIG_USER_NS is NOT enabled in the final .config — something downstream (vendor/board fragment) is overriding gki_defconfig. Actual line:"
+            grep -n 'CONFIG_USER_NS' "$CFG" || echo "(no CONFIG_USER_NS line found at all)"
+            exit 1
+          fi
 
       - name: Locate built Image
         working-directory: kernel_workspace
