@@ -53,13 +53,36 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 #    script instead (e.g. write "zenith" to each cpu's scaling_governor
 #    from a KernelSU/Magisk service.d script), not via Kconfig default.
 #
-# ADDED (this revision): Droidspaces container-runtime support — applies
+# ADDED (previous revision): Droidspaces container-runtime support — applies
 # the two official kABI-safe patches required for GKI 5.10 (SYSVIPC +
 # POSIX_MQUEUE, verified against ravindu644/Droidspaces-OSS upstream docs
 # and source), then enables exactly the GKI-Exclusive config set upstream
 # recommends (not the longer Non-GKI list, which would risk kABI
 # breakage). CONFIG_SYSVIPC/IPC_NS/POSIX_MQUEUE are only enabled if both
 # patches applied cleanly, to avoid shipping a bootlooping kernel.
+#
+# RE-ADDED (this revision): Baseband Guard (BBG) is back, but now patched
+# with a recovery-mode bypass instead of being removed outright.
+#
+# Root cause found by reading BBG's actual upstream source
+# (vc-teahouse/Baseband-guard): its default allowlist (baseband_guard.h)
+# already permits writes to boot/init_boot/vendor_boot/recovery/vbmeta/
+# userdata/cache/metadata/misc — none of those needed to be added, they
+# were never the problem. The real risk is BBG's deny() path returning
+# -EPERM to WHATEVER process trips a hook (e.g. OrangeFox trying an
+# ioctl/setattr/rename on a genuinely protected device node like a modem
+# partition, or hitting the LSM before its own trusted-process check can
+# apply) — if OrangeFox treats that EPERM as fatal during early recovery
+# init instead of failing soft, that's enough to crash-loop rather than
+# reach the UI. A new "Patch Baseband Guard" step (right after BBG is
+# cloned) adds an is_recovery_boot() helper — modeled on BBG's own
+# existing slot_suffix_from_cmdline() cmdline-parsing pattern — that
+# checks androidboot.mode=recovery, and makes deny() return 0 (allow)
+# whenever it's true, before the BB_ENFORCING check. Normal boot is
+# unaffected: BBG still fully enforces there. The patch step matches
+# baseband_guard.c's deny()/slot_suffix_from_cmdline() text exactly and
+# hard-fails the build (::error::) if either anchor isn't found, rather
+# than silently no-op'ing if upstream BBG's source changes shape.
 # ============================================================================
 
 on:
@@ -78,7 +101,7 @@ on:
         required: false
         default: "gki-custom"
       enable_bbg:
-        description: "Enable Baseband Guard (BBG) — LSM that blocks unauthorized writes to modem/bootloader partitions, protects against brick from malicious root modules"
+        description: "Enable Baseband Guard (BBG) — LSM that blocks unauthorized writes to modem/bootloader partitions, protects against brick from malicious root modules. Patched to bypass enforcement when booting into recovery (androidboot.mode=recovery)."
         required: true
         default: "true"
 
@@ -238,6 +261,88 @@ jobs:
           set -euo pipefail
           wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
 
+      - name: Patch Baseband Guard to bypass enforcement in recovery boot mode
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        working-directory: kernel_workspace/Baseband-guard
+        run: |
+          set -euo pipefail
+          python3 - << 'PYEOF'
+          import sys
+
+          with open("baseband_guard.c", "r") as f:
+              src = f.read()
+
+          # Anchor 1: end of the existing slot_suffix_from_cmdline() helper.
+          # We add our own is_recovery_boot() right after it, following the
+          # same saved_command_line-parsing pattern BBG already uses.
+          anchor1 = (
+              'if (p[0] == \'_\' && (p[1] == \'a\' || p[1] == \'b\')) '
+              'return (p[1] == \'a\') ? "_a" : "_b";\n'
+              '\treturn NULL;\n'
+              '}\n'
+          )
+          if anchor1 not in src:
+              print("::error::slot_suffix_from_cmdline() anchor not found — "
+                    "BBG source has changed shape, recovery bypass NOT applied. "
+                    "Refusing to continue rather than ship BBG without the fix.")
+              sys.exit(1)
+
+          recovery_helper = (
+              "\n"
+              "static bool is_recovery_boot(void)\n"
+              "{\n"
+              "\tconst char *p = saved_command_line;\n"
+              "\tif (!p) return false;\n"
+              "\treturn strstr(p, \"androidboot.mode=recovery\") != NULL;\n"
+              "}\n"
+          )
+          src = src.replace(anchor1, anchor1 + recovery_helper, 1)
+
+          # Anchor 2: the deny() function. Bypass BEFORE the BB_ENFORCING
+          # check, so it applies regardless of enforcing/permissive state,
+          # but ONLY when booting into recovery — normal boot still gets
+          # full enforcement.
+          deny_old = (
+              "static int deny(const char *why, struct file *file, "
+              "struct inode *inode, unsigned int cmd_opt)\n"
+              "{\n"
+              "\tbbg_log_deny_detail(why, file, inode, cmd_opt);\n"
+              "\tbb_pr_rl(\"deny %s pid=%d comm=%s\\n\", why, current->pid, "
+              "current->comm);\n"
+              "\tif (!BB_ENFORCING) return 0;\n"
+              "\treturn -EPERM;\n"
+              "}"
+          )
+          if deny_old not in src:
+              print("::error::deny() function anchor not found — BBG source "
+                    "has changed shape, recovery bypass NOT applied. Refusing "
+                    "to continue rather than ship BBG without the fix.")
+              sys.exit(1)
+
+          deny_new = (
+              "static int deny(const char *why, struct file *file, "
+              "struct inode *inode, unsigned int cmd_opt)\n"
+              "{\n"
+              "\tbbg_log_deny_detail(why, file, inode, cmd_opt);\n"
+              "\tbb_pr_rl(\"deny %s pid=%d comm=%s\\n\", why, current->pid, "
+              "current->comm);\n"
+              "\tif (is_recovery_boot()) {\n"
+              "\t\tbb_pr_rl(\"recovery boot detected, bypassing enforcement "
+              "for %s\\n\", why);\n"
+              "\t\treturn 0;\n"
+              "\t}\n"
+              "\tif (!BB_ENFORCING) return 0;\n"
+              "\treturn -EPERM;\n"
+              "}"
+          )
+          src = src.replace(deny_old, deny_new, 1)
+
+          with open("baseband_guard.c", "w") as f:
+              f.write(src)
+
+          print("Recovery-mode bypass applied to baseband_guard.c")
+          PYEOF
+
       - name: Configure Baseband Guard LSM
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
@@ -255,6 +360,12 @@ jobs:
             grep -n "baseband_guard" common/security/Kconfig || true
           else
             echo "::error::baseband_guard not found in common/security/Kconfig after setup — BBG install likely failed above"
+            exit 1
+          fi
+          if grep -q "is_recovery_boot" Baseband-guard/baseband_guard.c; then
+            echo "✓ Recovery-mode bypass present in baseband_guard.c"
+          else
+            echo "::error::Recovery-mode bypass missing from baseband_guard.c — patch step above did not apply"
             exit 1
           fi
 
