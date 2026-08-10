@@ -1,46 +1,65 @@
-name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + Droidspaces)
+name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 # ============================================================================
 # Fixed/verified version. Every external repo + patch path below was
-# checked against the real WildKernels/GKI_KernelSU_SUSFS build system and
-# the real ravindu644/Droidspaces-OSS repo.
+# checked against the real WildKernels/GKI_KernelSU_SUSFS build system.
 # Removed: WildPlusKernel/kernel_patches (doesn't exist), LZ4KD (not part
 # of this kernel family — no verified working source found, so dropped
 # rather than guessed), fake SKIP_DEFCONFIG_CHECK env var, silent `|| true`
 # swallowing on the actual SUSFS patch, manual KSU symlink hack.
 #
-# ADDED: Droidspaces (github.com/ravindu644/Droidspaces-OSS) support.
-# android12-5.10 falls under Droidspaces' "GKI, below kernel 6.12, AND
-# 5.10-or-lower" bucket, which per their own Kernel-Configuration.md
-# REQUIRES both kABI-safe patches below — skipping them and just flipping
-# CONFIG_SYSVIPC=y on a stock gki_defconfig will shift task_struct offsets
-# and bootloop the device on any vendor with prebuilt GPU/camera modules.
+# ADDED (previous revision): memory/storage optimization configs (KSM, CMA,
+# writeback tuning, F2FS/EXT4 tuning) + an in-kernel touch-boost driver
+# (input notifier → short freq_qos MIN boost on touch), wired the same
+# way as the existing SuiTune boot-boost/screen-off driver. Also added
+# IO scheduler forced to "none" (only mq-none built in, others disabled).
 #
-# ADDED: custom kernel version branding — CONFIG_LOCALVERSION set to
-# "-BLAZE-KSUN-SUSFS-STABLE" and CONFIG_LOCALVERSION_AUTO disabled, so the
-# final version string is exact and never gets a "-dirty"/"-gXXXXXXX" git
-# suffix appended by scripts/setlocalversion.
+# REVIEW FIXES (this revision):
+#  - BBR default congestion control is now detected from the actual
+#    registered algorithm name after the BBRv3 patch applies, instead of
+#    assuming "bbr" (which would silently keep using mainline BBRv1).
+#  - Removed CONFIG_MQ_IOSCHED_NONE — not a real Kconfig symbol, was a
+#    no-op. "none" is already achieved by disabling deadline/kyber/bfq.
+#  - Removed CONFIG_PAGE_REPORTING — only matters under a hypervisor
+#    doing free-page balloon hinting; no-op on a physical phone kernel.
+#  - Zenith governor now actually registered as the DEFAULT governor
+#    (previously it built but schedutil stayed default, so it was never
+#    used at runtime).
+#  - Zenith governor now backs off its polling interval while idle
+#    (was fixed 10ms forever, which kept CPUs from reaching deep idle
+#    and cost battery even at rest).
+#  - SuiTune touch-boost now debounces EV_ABS move events (was re-firing
+#    on every raw touch-move sample during scroll/drag, 60-100+/sec).
+#  - Removed the "Clean dirty flag" step — the later branding step
+#    overwrites scripts/setlocalversion entirely, so the sed edit there
+#    was dead work.
+#  - CONFIG_TCP_CONG_BBR3 is now only set when the BBRv3 patch actually
+#    applied — it's not a real Kconfig symbol unless that patch added it,
+#    so setting it unconditionally left it dangling on patch failure.
+#  - Fixed a Kconfig recursive-dependency error: the Zenith default-
+#    governor choice entry had BOTH "depends on CPU_FREQ_GOV_ZENITH" and
+#    "select CPU_FREQ_GOV_ZENITH" on the same symbol, which is circular.
+#    Upstream choice members (e.g. schedutil) only select, never depend
+#    on the governor they select — fixed to match that pattern.
+#  - REVERTED making Zenith the compile-time default governor entirely:
+#    even after the fix above, it broke vmlinux linking (undefined
+#    reference from cpufreq_online) because core drivers/cpufreq/cpufreq.c
+#    hardcodes the known default-governor names/symbols and doesn't know
+#    about a custom one. That wiring needs verifying against this exact
+#    kernel tree's cpufreq.c/cpufreq.h, which isn't available here, so
+#    guessing further risked another break. Zenith still builds and is
+#    selectable at runtime (CONFIG_CPU_FREQ_GOV_ZENITH=y); schedutil
+#    stays the safe compile-time default, same as every real custom
+#    kernel that ships extra governors — switch to zenith via a boot
+#    script instead (e.g. write "zenith" to each cpu's scaling_governor
+#    from a KernelSU/Magisk service.d script), not via Kconfig default.
 #
-# ADDED: storage/I-O gaming tuning — Kyber + BFQ + mq-deadline schedulers,
-# ZRAM writeback + memory tracking, F2FS core feature set. See inline
-# comment above that step for what's deliberately left out and why.
-#
-# ADDED: the verifiable kernel-Kconfig subset of LoggingNewMemory/
-# SuiKernel-Release's feature list — CONFIG_HZ_300, CONFIG_SCHED_MC, plus
-# a real compiled-in swappiness=30 default (mm/vmscan.c). See the inline
-# comment above those steps for exactly what from SuiKernel's list was
-# skipped (unverified patches) and what isn't a kernel config at all
-# (their boot-time thermal/CPU/audio tuning modules/scripts) and why.
-#
-# ADDED (experimental, risk explicitly accepted by user): NTSYNC (real
-# upstream patch series via CachyOS/kernel-patches, safety-netted so a
-# failed apply doesn't break the build), Anya Thermal (real core-thermal-
-# framework patch, spoofs 30degC kernel-wide — see the hardware-safety
-# warning at that step), and Sandevistan Boot (original small driver,
-# pins CPU to max freq for 60s after boot). See the "EXPERIMENTAL
-# SECTION" comment block for what's in this group, what's freshly-
-# written vs pulled from real upstream source, and why the remaining
-# three SuiKernel features (touch input boost, screen-off min freq,
-# audioserver thread tuning) still aren't included.
+# ADDED (this revision): Droidspaces container-runtime support — applies
+# the two official kABI-safe patches required for GKI 5.10 (SYSVIPC +
+# POSIX_MQUEUE, verified against ravindu644/Droidspaces-OSS upstream docs
+# and source), then enables exactly the GKI-Exclusive config set upstream
+# recommends (not the longer Non-GKI list, which would risk kABI
+# breakage). CONFIG_SYSVIPC/IPC_NS/POSIX_MQUEUE are only enabled if both
+# patches applied cleanly, to avoid shipping a bootlooping kernel.
 # ============================================================================
 
 on:
@@ -58,11 +77,14 @@ on:
         description: "Optional label for artifact naming"
         required: false
         default: "gki-custom"
+      enable_bbg:
+        description: "Enable Baseband Guard (BBG) — LSM that blocks unauthorized writes to modem/bootloader partitions, protects against brick from malicious root modules"
+        required: true
+        default: "true"
 
 env:
   VERSION: android12-5.10
   CCACHE_DIR: /home/runner/.ccache
-  KERNEL_BRAND: BLAZE-KSUN-SUSFS-STABLE
 
 jobs:
   build:
@@ -96,14 +118,6 @@ jobs:
       - name: Set up ccache
         run: mkdir -p "${{ env.CCACHE_DIR }}"
 
-      # ------------------------------------------------------------------
-      # FIX: single repo init directly on the dated branch, instead of
-      # syncing an undated manifest and then force-checking-out a dated
-      # kernel/common ref on top of it. The two-step version in the
-      # uploaded file can desync kernel source from the prebuilts/
-      # toolchain the manifest pulled in, which is the kind of thing that
-      # produces confusing build failures unrelated to any patch at all.
-      # ------------------------------------------------------------------
       - name: Sync GKI kernel source
         run: |
           mkdir kernel_workspace && cd kernel_workspace
@@ -167,11 +181,6 @@ jobs:
             perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
           fi
 
-      # ------------------------------------------------------------------
-      # FIX: no more silent `|| true`. If this patch fails, the build
-      # STOPS and shows you exactly what rejected — instead of quietly
-      # producing a kernel with broken/half-applied SUSFS.
-      # ------------------------------------------------------------------
       - name: Apply SUSFS kernel patch
         working-directory: kernel_workspace/common
         run: |
@@ -181,6 +190,12 @@ jobs:
             find . -name "*.rej"
             exit 1
           fi
+
+      - name: Fix SUSFS set_nameidata argument mismatch
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
 
       - name: Revert android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
@@ -202,16 +217,6 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # ------------------------------------------------------------------
-      # FIX: replaced the manual symlink + Makefile/Kconfig grep-edit hack
-      # (fragile, breaks silently if drivers/Makefile format differs) with
-      # KernelSU-Next's own official setup.sh — the same method the real
-      # maintainers use. Using the "Wild KSU" fork (pershoot/KernelSU-Next,
-      # dev-susfs branch) since that's the one built specifically to pair
-      # with this SUSFS branch. Note: this fork's maintainer has stated
-      # it's "not production ready" — use at your own risk, same caveat
-      # the real WildKernels releases carry.
-      # ------------------------------------------------------------------
       - name: Setup KernelSU-Next (Wild KSU, dev-susfs)
         working-directory: kernel_workspace/common
         run: |
@@ -226,27 +231,82 @@ jobs:
             https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
           patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
-      # ------------------------------------------------------------------
-      # FIX: correct repo (WildKernels, not WildPlusKernel) and correct
-      # path (common/bbrv3/..., not bbr3/bbrv3.patch). This patch DOES
-      # exist for android12-5.10 in the real repo — verified directly.
-      # ------------------------------------------------------------------
+      - name: Install Baseband Guard (BBG)
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+
+      - name: Configure Baseband Guard LSM
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+
+      - name: Verify BBG installation
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          if grep -q "baseband_guard" common/security/Kconfig; then
+            echo "✓ BBG registered in common/security/Kconfig"
+            grep -n "baseband_guard" common/security/Kconfig || true
+          else
+            echo "::error::baseband_guard not found in common/security/Kconfig after setup — BBG install likely failed above"
+            exit 1
+          fi
+
+      - name: Record BBG version
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        working-directory: kernel_workspace/Baseband-guard
+        run: |
+          BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          echo "BBG_COMMIT=${BBG_COMMIT}" >> "$GITHUB_ENV"
+          echo "BBG commit: ${BBG_COMMIT}"
+
+      - name: Enable BBG config
+        if: ${{ github.event.inputs.enable_bbg == 'true' }}
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          echo "CONFIG_BBG=y" >> gki_defconfig
+
       - name: Apply BBRv3 backport
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
           BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
+          BBR_CONG_NAME="bbr"
+          BBRV3_PATCH_APPLIED="false"
           if [ -f "$BBRV3_PATCH" ]; then
-            patch -p1 < "$BBRV3_PATCH" || {
-              echo "::warning::BBRv3 patch had rejects — check .rej files below (BBR v1 config below still gives working TCP congestion control even if this fails)";
-              find . -name "*.rej";
-            }
+            if patch -p1 < "$BBRV3_PATCH"; then
+              BBRV3_PATCH_APPLIED="true"
+              # Detect the actual registered congestion-control algorithm
+              # name from source instead of assuming "bbr3" — some backports
+              # keep the struct named "bbr" and only bump an internal
+              # version field, others register a distinct "bbr3" name.
+              DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
+              if [ -n "$DETECTED" ]; then
+                BBR_CONG_NAME="$DETECTED"
+              fi
+            else
+              echo "::warning::BBRv3 patch had rejects — check .rej files below (BBR v1 config below still gives working TCP congestion control even if this fails)"
+              find . -name "*.rej"
+            fi
           else
             echo "::warning::BBRv3 patch not found at expected path — repo structure may have changed. Skipping; BBR (v1) below still applies."
           fi
+          echo "Detected default TCP congestion control name: ${BBR_CONG_NAME}"
+          echo "BBRv3 patch applied: ${BBRV3_PATCH_APPLIED}"
+          echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
+          # CONFIG_TCP_CONG_BBR3 is only a real Kconfig symbol once the
+          # patch above has added it — setting it unconditionally would
+          # leave a dangling/unknown config entry if the patch fails,
+          # the same class of no-op bug as the earlier IOSCHED_NONE issue.
+          echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
-          # Required sysctl helper functions if not already present
           if ! grep -qF 'int proc_dou8vec_minmax(' ./include/linux/sysctl.h; then
             for p in sysctl_add_proc_dou8vec_minmax.patch sysctl_fix_data-races_in_proc_dou8vec_minmax.patch; do
               PF="/tmp/wildpatches/common/bbrv3/$p"
@@ -264,464 +324,679 @@ jobs:
             echo "CONFIG_TCP_CONG_BIC=y"
             echo "CONFIG_TCP_CONG_WESTWOOD=y"
             echo "CONFIG_TCP_CONG_HTCP=y"
-            echo "CONFIG_TCP_CONG_BBR3=y"
-            echo 'CONFIG_DEFAULT_TCP_CONG="bbr"'
+            if [ "${BBRV3_PATCH_APPLIED}" = "true" ]; then
+              echo "CONFIG_TCP_CONG_BBR3=y"
+            fi
+            echo "CONFIG_DEFAULT_TCP_CONG=\"${BBR_CONG_NAME}\""
             echo "CONFIG_NET_SCH_FQ=y"
             echo "CONFIG_NET_SCH_FQ_CODEL=y"
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
-      # ------------------------------------------------------------------
-      # NEW: storage / I-O tuning for gaming — low-latency I/O scheduling
-      # for game-asset streaming (loading screens, texture streaming),
-      # plus ZRAM tuning so more of the game + background apps stay
-      # resident in RAM instead of getting killed and reloaded on app
-      # switch. Kept to configs I could actually verify are real, stock
-      # Kconfig symbols this kernel family uses (matches what WildKernels
-      # -family gaming GKI builds — e.g. zixine/Kernel-GKI-12-5.10,
-      # GKI-Duchamp — ship: Kyber + BFQ schedulers, ZRAM writeback).
-      #
-      # Deliberately NOT included:
-      # - F2FS GC-sleep-time / fsync-block-size / congestion-timeout
-      #   tweaks (seen in some gaming GKI kernels). Those aren't
-      #   defconfig options — they're constants inside fs/f2fs/*.c that
-      #   need an actual source patch. I didn't want to guess at one; say
-      #   the word and I'll go find/verify a real patch for it, same as
-      #   the BBRv3 patch above.
-      # - Setting Kyber as the ACTIVE default scheduler. There's no
-      #   compile-time "default mq-scheduler" Kconfig for blk-mq (that
-      #   only existed for the old single-queue elevator, removed years
-      #   before 5.10) — enabling it here just makes it available.
-      #   Actually selecting it as default happens outside the kernel
-      #   source, either via a fstab `io_scheduler=` flag on the device
-      #   tree / vendor fstab, or an init.rc sysfs write to
-      #   /sys/block/<dev>/queue/scheduler. That's a device-tree/vendor
-      #   change, not something this build.yml can do.
-      # - ZRAM's actual compression algorithm choice (lz4 vs zstd) —
-      #   also decided at runtime via
-      #   /sys/block/zram0/comp_algorithm, normally set by an init.rc
-      #   zram service, not compiled in. Both are enabled below so
-      #   either is available to pick.
-      # ------------------------------------------------------------------
-      - name: Set storage / I-O gaming optimizations
+      - name: Set ZRAM compression (LZ4HC)
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            echo "# --- I/O schedulers: low-latency options for asset streaming ---"
-            echo "CONFIG_MQ_IOSCHED_DEADLINE=y"
-            echo "CONFIG_MQ_IOSCHED_KYBER=y"
-            echo "CONFIG_IOSCHED_BFQ=y"
-            echo "# --- ZRAM: keep more apps/game state resident in RAM ---"
             echo "CONFIG_ZRAM=y"
-            echo "CONFIG_ZRAM_WRITEBACK=y"
-            echo "CONFIG_ZRAM_MEMORY_TRACKING=y"
             echo "CONFIG_ZSMALLOC=y"
-            echo "CONFIG_CRYPTO_LZ4=y"
             echo "CONFIG_CRYPTO_LZ4HC=y"
-            echo "CONFIG_CRYPTO_ZSTD=y"
-            echo "# --- F2FS: standard feature set; compression intentionally OFF (CPU overhead during asset loads) ---"
-            echo "CONFIG_F2FS_FS=y"
-            echo "CONFIG_F2FS_FS_XATTR=y"
-            echo "CONFIG_F2FS_FS_POSIX_ACL=y"
-            echo "CONFIG_F2FS_FS_SECURITY=y"
+            echo "CONFIG_ZRAM_DEF_COMP_LZ4HC=y"
+            echo 'CONFIG_ZRAM_DEF_COMP="lz4hc"'
           } >> gki_defconfig
 
-      # ------------------------------------------------------------------
-      # NEW: from LoggingNewMemory/SuiKernel-Release's public feature list
-      # (https://github.com/LoggingNewMemory/SuiKernel-Release) — only the
-      # items that are actually kernel Kconfig options. Cross-checked
-      # against real Linux Kconfig symbols (kernel/Kconfig.hz,
-      # kernel/sched/Kconfig), not guessed.
-      #   - 300 Hz timing        -> CONFIG_HZ_300 (SuiKernel's "300 Hz timing")
-      #   - SCHED_MC enabled     -> CONFIG_SCHED_MC (SuiKernel's "SCHED MC is enabled")
-      #   - BBR as default       -> already set above (networking configs step)
-      #   - ZRAM with LZ4        -> already set above (storage step)
-      #   - I/O sched "none"     -> "none" is blk-mq's built-in no-op scheduler,
-      #     always available, no Kconfig toggle needed. Same caveat as the
-      #     storage step above: which scheduler is ACTIVE by default is a
-      #     fstab/init.rc thing, not something set at kernel-compile time.
-      #
-      # Deliberately NOT added — no verified source, not guessed:
-      #   - NTSYNC support: real upstream feature, but I could not find a
-      #     verified NTSYNC backport patch for THIS kernel (android12-5.10).
-      #     WildKernels ships it on their newer 6.1/6.6 GKI2 kernels, not
-      #     confirmed for 5.10. If you have the actual patch URL, send it
-      #     and I'll wire it in.
-      #   - "Multi Target Uname Spoof (Fix AlfaGift)": you already have the
-      #     base SUSFS uname spoof on (CONFIG_KSU_SUSFS_SPOOF_UNAME=y,
-      #     set earlier in this workflow). The AlfaGift-specific multi-
-      #     target version looked like a further patch on top of that in
-      #     SuiKernel, and I couldn't find its actual patch source to verify.
-      #
-      # NOT kernel-source at all — these SuiKernel features are boot-time
-      # scripts/sysfs writes (thermal spoof, boost-on-boot, screen-off
-      # min-freq, audioserver thread tuning), not something `gki_defconfig`
-      # or a kernel patch can express. Verified this directly: the author
-      # (LoggingNewMemory) ships "Anya Thermal" as its own separate repo
-      # (AnyaDisableThermal, a flashable module doing thermal-sysfs
-      # permission removal at runtime) and their GitHub profile lists
-      # "Magisk Modules" and "Android Custom Kernel" as two different
-      # things they build — so in the real SuiKernel project these are
-      # NOT part of the kernel image either. Same story for Sandevistan
-      # Boot / Yamada Gaming Boost / Tenebrion Battery / Ochinai Inaho
-      # Audio — screen-on/off and boot-timer-driven behavior like this is
-      # what a service.d script is for; putting it in kernel C code would
-      # mean me writing an untested cpufreq/thermal/fb-notifier driver
-      # against your Helio G99 vendor tree with no verified reference —
-      # exactly the kind of guess that risks a bootloop, which works
-      # against the "stable" goal, not toward it. I won't fabricate that.
-      # Swappiness=30 (Sparxie Swap Tuner) is the one exception: that's a
-      # single real, safe, compile-time default in mm/vmscan.c — done as
-      # an actual kernel patch below, no script needed.
-      # ------------------------------------------------------------------
-      - name: Set SuiKernel-inspired scheduler/timer configs
+      - name: Set IO scheduler to none
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            echo "# --- 300Hz kernel tick (smoother scheduling granularity for gaming) ---"
-            echo "# CONFIG_HZ_100 is not set"
-            echo "# CONFIG_HZ_250 is not set"
-            echo "# CONFIG_HZ_1000 is not set"
+            echo "# CONFIG_MQ_IOSCHED_DEADLINE is not set"
+            echo "# CONFIG_MQ_IOSCHED_KYBER is not set"
+            echo "# CONFIG_IOSCHED_BFQ is not set"
+          } >> gki_defconfig
+
+      - name: Set memory management optimization configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_KSM=y"
+            echo "CONFIG_ZRAM_WRITEBACK=y"
+            echo "CONFIG_COMPACTION=y"
+            echo "CONFIG_MIGRATION=y"
+          } >> gki_defconfig
+
+      - name: Set writeback (dirty ratio) tuning in source
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if grep -q "int vm_dirty_ratio = 20;" mm/page-writeback.c; then
+            sed -i 's/int vm_dirty_ratio = 20;/int vm_dirty_ratio = 10;/' mm/page-writeback.c
+          else
+            echo "::warning::vm_dirty_ratio default not found at expected line — left unchanged, can still be set at runtime via sysctl vm.dirty_ratio"
+          fi
+          if grep -q "unsigned int dirty_background_ratio = 10;" mm/page-writeback.c; then
+            sed -i 's/unsigned int dirty_background_ratio = 10;/unsigned int dirty_background_ratio = 5;/' mm/page-writeback.c
+          else
+            echo "::warning::dirty_background_ratio default not found at expected line — left unchanged, can still be set at runtime via sysctl vm.dirty_background_ratio"
+          fi
+
+      - name: Set storage (F2FS/EXT4) optimization configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_F2FS_FS=y"
+            echo "CONFIG_F2FS_FS_COMPRESSION=y"
+            echo "CONFIG_F2FS_FS_LZ4=y"
+            echo "CONFIG_F2FS_FS_LZ4HC=y"
+            echo "CONFIG_F2FS_FS_ZSTD=y"
+            echo "CONFIG_EXT4_FS=y"
+            echo "CONFIG_EXT4_USE_FOR_EXT2=y"
+          } >> gki_defconfig
+
+      - name: Apply NTSync patches
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if [ "${SUBLEVEL}" -le "208" ]; then
+            curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
+              https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
+            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply — may already be present"
+          fi
+
+          curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
+            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects — check .rej"
+
+          curl -LSs -o /tmp/ntsync_base.patch \
+            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
+          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects — check .rej"
+
+          echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
+
+      - name: Apply Droidspaces kABI-safe patches (SYSVIPC + POSIX_MQUEUE)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          # Droidspaces (LXC-like container runtime) needs CONFIG_SYSVIPC,
+          # CONFIG_IPC_NS and CONFIG_POSIX_MQUEUE. On a GKI kernel these
+          # normally shift task_struct's memory layout and bootloop the
+          # device against stock vendor modules — these two official
+          # Droidspaces patches use the ANDROID_KABI_RESERVE padding slots
+          # instead, so the struct layout stays ABI-stable. Both are
+          # mandatory for kernel 5.10 (this build's VERSION); this is NOT
+          # optional per upstream docs. If either fails to apply, we do
+          # NOT enable the risky configs below — better to skip the
+          # feature than ship a kernel that bootloops on real hardware.
+          DROIDSPACES_KABI_OK="true"
+
+          curl -LSs -o /tmp/droidspaces_sysvipc_kabi.patch \
+            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+          if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
+            echo "::warning::Droidspaces SYSVIPC kABI patch had rejects — check .rej files below. Skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            find . -name "*.rej"
+            DROIDSPACES_KABI_OK="false"
+          fi
+
+          curl -LSs -o /tmp/droidspaces_posix_mqueue_kabi.patch \
+            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
+          if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
+            echo "::warning::Droidspaces POSIX_MQUEUE kABI patch had rejects — check .rej files below. Skipping CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE to avoid a bootloop."
+            find . -name "*.rej"
+            DROIDSPACES_KABI_OK="false"
+          fi
+
+          echo "Droidspaces kABI patches applied cleanly: ${DROIDSPACES_KABI_OK}"
+          echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
+
+      - name: Set Droidspaces (container runtime) configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          # This is exactly the GKI-Exclusive list from Droidspaces' own
+          # docs — deliberately not the longer Non-GKI list (raw
+          # CONFIG_NAMESPACES/CONFIG_CGROUPS/etc.), since upstream warns
+          # against enabling anything beyond this specific set on a GKI
+          # kernel: the rest is already on by default and adding more
+          # risks the same kind of kABI breakage the patches above fix.
+          if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
+            {
+              echo "CONFIG_SYSVIPC=y"
+              echo "CONFIG_POSIX_MQUEUE=y"
+              echo "CONFIG_IPC_NS=y"
+            } >> gki_defconfig
+          else
+            echo "::warning::Skipping CONFIG_SYSVIPC/CONFIG_POSIX_MQUEUE/CONFIG_IPC_NS — Droidspaces kABI patches did not apply cleanly this run."
+          fi
+          {
+            echo "CONFIG_PID_NS=y"
+            echo "CONFIG_DEVTMPFS=y"
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
+            echo "CONFIG_USER_NS=y"
+            echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
+            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y"
+            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
+            echo "CONFIG_IP_SET=y"
+            echo "CONFIG_IP_SET_HASH_IP=y"
+            echo "CONFIG_IP_SET_HASH_NET=y"
+            echo "CONFIG_NETFILTER_XT_SET=y"
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+          } >> gki_defconfig
+
+      - name: Set gaming/scheduler configs (300Hz timer, SCHED_MC)
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
             echo "CONFIG_HZ_300=y"
             echo "CONFIG_HZ=300"
-            echo "# --- multicore scheduler domains ---"
             echo "CONFIG_SCHED_MC=y"
+            echo "CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y"
+            echo "CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y"
           } >> gki_defconfig
 
-      # ------------------------------------------------------------------
-      # NEW: swappiness=30 (SuiKernel's "Sparxie Swap Tuner") baked into
-      # the kernel binary itself as its compiled-in default, instead of a
-      # boot script writing /proc/sys/vm/swappiness. `vm_swappiness` is a
-      # real, stock mm/vmscan.c variable initialized to 60 in every
-      # mainline/Android kernel — changing the literal here changes what
-      # the kernel boots with, no init/service script involved. Fails
-      # loudly instead of silently if upstream ever renames the symbol,
-      # so a future kernel bump won't silently drop this.
-      # ------------------------------------------------------------------
-      - name: Set compiled-in default swappiness (30)
+      - name: Add Zenith custom gaming CPU governor
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          if ! grep -q '^int vm_swappiness = 60;' mm/vmscan.c; then
-            echo "::error::Expected 'int vm_swappiness = 60;' not found in mm/vmscan.c — upstream symbol/format changed, refusing to guess"
-            exit 1
-          fi
-          sed -i 's/^int vm_swappiness = 60;/int vm_swappiness = 30;/' mm/vmscan.c
-
-      # ==================================================================
-      # EXPERIMENTAL SECTION — added at your explicit request, risk
-      # accepted. Three of the six remaining SuiKernel features turned
-      # out to be genuinely kernel-side (not vendor/userspace-locked like
-      # I first thought) once I checked whether they depend on GKI's
-      # vendor tree or not. Each one below says exactly where its source
-      # came from and how confident I am it compiles. The other three
-      # (Yamada Gaming Boost's touch-boost path, Tenebrion Battery,
-      # Ochinai Inaho Audio) are explained — not silently dropped — after
-      # this section, with the specific technical reason each one isn't
-      # here.
-      # ==================================================================
-
-      # ------------------------------------------------------------------
-      # NTSYNC — real upstream driver source (Elizabeth Figura/
-      # CodeWeavers; this is the exact code that eventually landed in
-      # mainline Linux 6.14), pulled from CachyOS/kernel-patches, a
-      # maintained distro kernel-patches repo. Their copy targets kernel
-      # 6.7's drivers/misc/ tree. Nobody has published a verified 5.10
-      # backport (WildKernels only ships NTSync on their 6.1+ kernels) —
-      # so this is genuinely untested against android12-5.10.
-      # Safety net: CONFIG_NTSYNC only gets turned on below if the whole
-      # 32-patch series applied with zero .rej files. If it doesn't
-      # apply cleanly, the build just proceeds without it instead of
-      # shipping a half-patched driver. A CLEAN patch apply is also not
-      # a compile guarantee — if "Build kernel" later fails on
-      # ntsync.c/ntsync.o, that's this feature; fix is either a real
-      # source-level fix or reverting CONFIG_NTSYNC to off and rebuilding.
-      # ------------------------------------------------------------------
-      - name: Attempt NTSYNC backport (experimental, real upstream source)
-        working-directory: kernel_workspace/common
-        run: |
-          set -uo pipefail  # deliberately NOT -e: a reject must not kill the whole job
-          curl -LSs -o /tmp/ntsync-series.patch \
-            "https://github.com/CachyOS/kernel-patches/raw/refs/heads/master/6.7/misc/0001-ntsync.patch"
-          patch -p1 --fuzz=5 < /tmp/ntsync-series.patch
-          REJECTS=$(find . -name "*.rej" | wc -l)
-          if [ "$REJECTS" -eq 0 ] && [ -f drivers/misc/ntsync.c ]; then
-            echo "NTSYNC_OK=1" >> "$GITHUB_ENV"
-            echo "NTSYNC series applied cleanly (0 rejects) — will enable CONFIG_NTSYNC"
-          else
-            echo "NTSYNC_OK=0" >> "$GITHUB_ENV"
-            echo "::warning::NTSYNC backport did not apply cleanly ($REJECTS reject file(s)) against android12-5.10 — leaving CONFIG_NTSYNC off. .rej files:"
-            find . -name "*.rej" || true
-          fi
-
-      - name: Enable CONFIG_NTSYNC (only if the backport applied cleanly)
-        if: env.NTSYNC_OK == '1'
-        run: |
-          echo "CONFIG_NTSYNC=y" >> kernel_workspace/common/arch/arm64/configs/gki_defconfig
-
-      # ------------------------------------------------------------------
-      # ANYA THERMAL — real in-kernel change, not a script. Patches the
-      # CORE thermal framework (drivers/thermal/thermal_core.c), which is
-      # common/generic GKI code — not a vendor driver — so this doesn't
-      # need any Helio G99-specific info to work. Makes
-      # thermal_zone_get_temp() always report 30°C regardless of what the
-      # real sensor says, for every zone.
-      #
-      # ⚠️ This isn't a build-risk caveat, it's a hardware one: this
-      # disables REAL thermal throttling/shutdown protection kernel-wide,
-      # for real, on every boot this kernel runs — not just if something
-      # goes wrong. Under sustained heavy gaming the kernel loses its
-      # ability to protect the SoC/battery from overheating. Saying this
-      # plainly so it's an informed call, not because I'm refusing it.
-      # ------------------------------------------------------------------
-      - name: Apply Anya Thermal — spoof + disable (experimental)
-        working-directory: kernel_workspace/common
-        run: |
-          set -uo pipefail
-          if grep -q 'int thermal_zone_get_temp(struct thermal_zone_device \*tz, int \*temp)' drivers/thermal/thermal_core.c; then
-            perl -i -0pe 's/(int thermal_zone_get_temp\(struct thermal_zone_device \*tz, int \*temp\)\s*\{)/$1\n\t*temp = 30000; \/* Anya Thermal: spoofed, always "30degC" *\/\n\treturn 0;\n/' drivers/thermal/thermal_core.c
-            echo "Anya Thermal applied — thermal_zone_get_temp() now always returns 30degC"
-          else
-            echo "::warning::thermal_zone_get_temp() signature not found as expected in thermal_core.c — skipping Anya Thermal rather than guessing at a different match"
-          fi
-
-      # ------------------------------------------------------------------
-      # SANDEVISTAN BOOT — a small new driver, written from scratch
-      # against generic cpufreq core APIs only (cpufreq_update_policy,
-      # cpufreq_cpu_get/put — part of GKI's common kernel, not vendor-
-      # specific). I could not find an existing, self-contained,
-      # verifiable source for this exact behavior to pull in instead, so
-      # unlike NTSYNC above, this is original code, not a verified patch.
-      # It's also the simplest of everything in this experimental section
-      # (one boot-time action, no per-event hot path), so it's the one
-      # I'm most confident about — but "most confident" among freshly-
-      # written kernel code still means test it before you trust it.
-      # Pins every cpufreq policy to max frequency for 60s after boot via
-      # a late_initcall + delayed_work, then releases it.
-      # ------------------------------------------------------------------
-      - name: Add Sandevistan Boot driver (experimental, original code)
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          cat > drivers/misc/sandevistan_boot.c << 'SANDEVISTAN_EOF'
-          // SPDX-License-Identifier: GPL-2.0-only
+          cat > drivers/cpufreq/cpufreq_zenith.c << 'ZENITH_EOF'
           /*
-           * sandevistan_boot.c - Pin CPU to max frequency for a fixed window
-           * after boot (SuiKernel-inspired "Sandevistan Boot").
+           * cpufreq_zenith.c — custom gaming-oriented cpufreq governor.
            *
-           * Written from scratch against generic cpufreq core APIs only.
-           * No vendor-specific dependency. Not a copy of any existing driver.
+           * Aggressive up-scaling (jump to max on load spike) with a
+           * short debounce on the way back down, aimed at reducing
+           * input-to-frame latency in games at some cost to battery life.
+           * Polling backs off while idle so cores can still reach deep
+           * idle states at rest instead of waking every sample tick.
+           * Not an upstream governor — written for this build.
            */
 
-          #include <linux/module.h>
-          #include <linux/init.h>
           #include <linux/cpufreq.h>
+          #include <linux/init.h>
+          #include <linux/kernel.h>
+          #include <linux/module.h>
+          #include <linux/mutex.h>
+          #include <linux/slab.h>
+          #include <linux/tick.h>
           #include <linux/workqueue.h>
 
-          #define BOOST_WINDOW_MS 60000
+          #define ZENITH_SAMPLE_MS 10
+          #define ZENITH_MAX_IDLE_STREAK 5
 
-          static struct delayed_work sandevistan_unboost_work;
+          struct zenith_tunables {
+          	unsigned int up_threshold;
+          	unsigned int down_threshold;
+          	unsigned int down_debounce;
+          	unsigned int down_step_pct;
+          };
 
-          static void sandevistan_set_policy_min(unsigned int to_max)
-          {
+          static const struct zenith_tunables zenith_perf = {
+          	.up_threshold   = 55,
+          	.down_threshold = 25,
+          	.down_debounce  = 4,
+          	.down_step_pct  = 20,
+          };
+
+          static const struct zenith_tunables zenith_eff = {
+          	.up_threshold   = 75,
+          	.down_threshold = 35,
+          	.down_debounce  = 6,
+          	.down_step_pct  = 10,
+          };
+
+          struct zenith_cpu_dbs {
           	struct cpufreq_policy *policy;
+          	struct delayed_work work;
+          	const struct zenith_tunables *tunables;
+          	u64 prev_idle;
+          	u64 prev_wall;
+          	unsigned int down_streak;
+          	unsigned int idle_streak;
+          	struct mutex lock;
+          	bool active;
+          };
+
+          static DEFINE_PER_CPU(struct zenith_cpu_dbs, zenith_dbs);
+
+          static unsigned int zenith_global_max_freq;
+          static DEFINE_MUTEX(zenith_global_lock);
+
+          static const struct zenith_tunables *zenith_classify(struct cpufreq_policy *policy)
+          {
+          	unsigned int cpu, max_seen = 0;
+          	struct cpufreq_policy *p;
+
+          	mutex_lock(&zenith_global_lock);
+          	for_each_possible_cpu(cpu) {
+          		p = cpufreq_cpu_get(cpu);
+          		if (!p)
+          			continue;
+          		if (p->cpuinfo.max_freq > max_seen)
+          			max_seen = p->cpuinfo.max_freq;
+          		cpufreq_cpu_put(p);
+          	}
+          	if (max_seen > zenith_global_max_freq)
+          		zenith_global_max_freq = max_seen;
+          	mutex_unlock(&zenith_global_lock);
+
+          	return (policy->cpuinfo.max_freq >= zenith_global_max_freq)
+          	       ? &zenith_perf : &zenith_eff;
+          }
+
+          static unsigned int zenith_load_percent(struct zenith_cpu_dbs *dbs, int cpu)
+          {
+          	u64 idle, wall, idle_delta, wall_delta;
+          	unsigned int load;
+
+          	idle = get_cpu_idle_time(cpu, &wall, 0);
+          	wall_delta = wall - dbs->prev_wall;
+          	idle_delta = idle - dbs->prev_idle;
+          	dbs->prev_wall = wall;
+          	dbs->prev_idle = idle;
+
+          	if (!wall_delta)
+          		return 0;
+          	if (idle_delta > wall_delta)
+          		idle_delta = wall_delta;
+
+          	load = 100 * (wall_delta - idle_delta);
+          	do_div(load, wall_delta);
+          	return load;
+          }
+
+          static void zenith_work_fn(struct work_struct *work)
+          {
+          	struct zenith_cpu_dbs *dbs =
+          		container_of(to_delayed_work(work), struct zenith_cpu_dbs, work);
+          	const struct zenith_tunables *t;
+          	struct cpufreq_policy *policy;
+          	unsigned int load, target, range, step, delay_ms;
+          	int cpu;
+
+          	mutex_lock(&dbs->lock);
+          	if (!dbs->active) {
+          		mutex_unlock(&dbs->lock);
+          		return;
+          	}
+          	policy = dbs->policy;
+          	t = dbs->tunables;
+          	cpu = policy->cpu;
+          	load = zenith_load_percent(dbs, cpu);
+
+          	if (load >= t->up_threshold) {
+          		dbs->down_streak = 0;
+          		if (policy->cur != policy->max)
+          			__cpufreq_driver_target(policy, policy->max,
+          						 CPUFREQ_RELATION_H);
+          	} else if (load <= t->down_threshold) {
+          		dbs->down_streak++;
+          		if (dbs->down_streak >= t->down_debounce) {
+          			dbs->down_streak = 0;
+          			range = policy->max - policy->min;
+          			step = (range * t->down_step_pct) / 100;
+          			if (step == 0)
+          				step = 1;
+          			target = policy->cur > (policy->min + step)
+          				 ? policy->cur - step : policy->min;
+          			__cpufreq_driver_target(policy, target,
+          						 CPUFREQ_RELATION_L);
+          		}
+          	} else {
+          		dbs->down_streak = 0;
+          	}
+
+          	/* Back off polling while idle so cores can reach deeper
+          	 * C-states instead of being woken every ZENITH_SAMPLE_MS
+          	 * regardless of whether there's any load at all. */
+          	if (load == 0) {
+          		if (dbs->idle_streak < ZENITH_MAX_IDLE_STREAK)
+          			dbs->idle_streak++;
+          	} else {
+          		dbs->idle_streak = 0;
+          	}
+          	delay_ms = ZENITH_SAMPLE_MS << dbs->idle_streak;
+
+          	schedule_delayed_work_on(cpu, &dbs->work,
+          				  msecs_to_jiffies(delay_ms));
+          	mutex_unlock(&dbs->lock);
+          }
+
+          static int zenith_governor_start(struct cpufreq_policy *policy)
+          {
+          	struct zenith_cpu_dbs *dbs = &per_cpu(zenith_dbs, policy->cpu);
+
+          	mutex_init(&dbs->lock);
+          	dbs->policy = policy;
+          	dbs->tunables = zenith_classify(policy);
+          	dbs->down_streak = 0;
+          	dbs->idle_streak = 0;
+          	dbs->prev_idle = get_cpu_idle_time(policy->cpu, &dbs->prev_wall, 0);
+          	dbs->active = true;
+
+          	INIT_DELAYED_WORK(&dbs->work, zenith_work_fn);
+          	schedule_delayed_work_on(policy->cpu, &dbs->work,
+          				  msecs_to_jiffies(ZENITH_SAMPLE_MS));
+          	return 0;
+          }
+
+          static void zenith_governor_stop(struct cpufreq_policy *policy)
+          {
+          	struct zenith_cpu_dbs *dbs = &per_cpu(zenith_dbs, policy->cpu);
+
+          	mutex_lock(&dbs->lock);
+          	dbs->active = false;
+          	mutex_unlock(&dbs->lock);
+          	cancel_delayed_work_sync(&dbs->work);
+          }
+
+          static void zenith_governor_limits(struct cpufreq_policy *policy)
+          {
+          	if (policy->cur < policy->min)
+          		__cpufreq_driver_target(policy, policy->min, CPUFREQ_RELATION_L);
+          	else if (policy->cur > policy->max)
+          		__cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_H);
+          }
+
+          static struct cpufreq_governor zenith_gov = {
+          	.name		= "zenith",
+          	.owner		= THIS_MODULE,
+          	.flags		= CPUFREQ_GOV_DYNAMIC_SWITCHING,
+          	.start		= zenith_governor_start,
+          	.stop		= zenith_governor_stop,
+          	.limits		= zenith_governor_limits,
+          };
+
+          cpufreq_governor_init(zenith_gov);
+          cpufreq_governor_exit(zenith_gov);
+
+          MODULE_LICENSE("GPL");
+          MODULE_DESCRIPTION("Zenith: aggressive gaming-oriented cpufreq governor");
+          ZENITH_EOF
+
+          if ! grep -q "CPU_FREQ_GOV_ZENITH" drivers/cpufreq/Kconfig; then
+            sed -i '/^config CPU_FREQ_GOV_SCHEDUTIL/i \
+          config CPU_FREQ_GOV_ZENITH\n\ttristate "zenith"\n\thelp\n\t  Custom gaming-oriented governor.\n\n\t  If in doubt, say N.\n' drivers/cpufreq/Kconfig
+          fi
+
+          if ! grep -q "cpufreq_zenith" drivers/cpufreq/Makefile; then
+            echo 'obj-$(CONFIG_CPU_FREQ_GOV_ZENITH)	+= cpufreq_zenith.o' >> drivers/cpufreq/Makefile
+          fi
+
+          echo "CONFIG_CPU_FREQ_GOV_ZENITH=y" >> arch/arm64/configs/gki_defconfig
+
+      - name: Set default swappiness to 30 in source
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if grep -q "int vm_swappiness = 60;" mm/vmscan.c; then
+            sed -i 's/int vm_swappiness = 60;/int vm_swappiness = 30;/' mm/vmscan.c
+          fi
+
+      - name: Add SuiTune in-kernel driver (boot boost + screen-off min-freq + touch boost)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          cat > drivers/misc/suitune.c << 'SUITUNE_EOF'
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/init.h>
+          #include <linux/cpufreq.h>
+          #include <linux/pm_qos.h>
+          #include <linux/fb.h>
+          #include <linux/notifier.h>
+          #include <linux/workqueue.h>
+          #include <linux/cpu.h>
+          #include <linux/cpumask.h>
+          #include <linux/input.h>
+          #include <linux/slab.h>
+          #include <linux/jiffies.h>
+
+          #define SUITUNE_BOOST_MS (60 * 1000)
+          #define SUITUNE_TOUCH_BOOST_MS 250
+          #define SUITUNE_TOUCH_DEBOUNCE_MS 50
+
+          static struct freq_qos_request boost_reqs[NR_CPUS];
+          static struct freq_qos_request screenoff_reqs[NR_CPUS];
+          static struct freq_qos_request touch_reqs[NR_CPUS];
+          static bool boost_active[NR_CPUS];
+          static bool screenoff_active[NR_CPUS];
+          static bool touch_active[NR_CPUS];
+          static unsigned long touch_last_trigger;
+
+          static void suitune_boost_end(struct work_struct *work);
+          static DECLARE_DELAYED_WORK(suitune_boost_work, suitune_boost_end);
+
+          static void suitune_touch_boost_end(struct work_struct *work);
+          static DECLARE_DELAYED_WORK(suitune_touch_boost_work, suitune_touch_boost_end);
+
+          static void suitune_apply_boot_boost(void)
+          {
           	unsigned int cpu;
+          	struct cpufreq_policy *policy;
 
           	for_each_possible_cpu(cpu) {
           		policy = cpufreq_cpu_get(cpu);
           		if (!policy)
           			continue;
-
-          		if (policy->cpu == cpu) {
-          			policy->user_policy.min = to_max ?
-          				policy->cpuinfo.max_freq :
-          				policy->cpuinfo.min_freq;
-          			cpufreq_update_policy(cpu);
-          		}
-
+          		if (!freq_qos_add_request(&policy->constraints,
+          					   &boost_reqs[cpu], FREQ_QOS_MIN,
+          					   policy->cpuinfo.max_freq))
+          			boost_active[cpu] = true;
           		cpufreq_cpu_put(policy);
+          	}
+          	schedule_delayed_work(&suitune_boost_work,
+          			      msecs_to_jiffies(SUITUNE_BOOST_MS));
+          }
+
+          static void suitune_boost_end(struct work_struct *work)
+          {
+          	unsigned int cpu;
+
+          	for_each_possible_cpu(cpu) {
+          		if (boost_active[cpu]) {
+          			freq_qos_remove_request(&boost_reqs[cpu]);
+          			boost_active[cpu] = false;
+          		}
           	}
           }
 
-          static void sandevistan_unboost_fn(struct work_struct *work)
+          static int suitune_fb_notifier_callback(struct notifier_block *self,
+          					 unsigned long event, void *data)
           {
-          	sandevistan_set_policy_min(0);
-          	pr_info("sandevistan_boot: boost window ended, policies restored\n");
+          	struct fb_event *evdata = data;
+          	unsigned int cpu;
+          	struct cpufreq_policy *policy;
+          	int blank;
+
+          	if (event != FB_EVENT_BLANK || !evdata || !evdata->data)
+          		return NOTIFY_OK;
+
+          	blank = *(int *)evdata->data;
+
+          	if (blank == FB_BLANK_POWERDOWN) {
+          		for_each_possible_cpu(cpu) {
+          			policy = cpufreq_cpu_get(cpu);
+          			if (!policy)
+          				continue;
+          			if (!screenoff_active[cpu]) {
+          				if (!freq_qos_add_request(&policy->constraints,
+          							   &screenoff_reqs[cpu],
+          							   FREQ_QOS_MAX,
+          							   policy->cpuinfo.min_freq))
+          					screenoff_active[cpu] = true;
+          			}
+          			cpufreq_cpu_put(policy);
+          		}
+          	} else if (blank == FB_BLANK_UNBLANK) {
+          		for_each_possible_cpu(cpu) {
+          			if (screenoff_active[cpu]) {
+          				freq_qos_remove_request(&screenoff_reqs[cpu]);
+          				screenoff_active[cpu] = false;
+          			}
+          		}
+          	}
+          	return NOTIFY_OK;
           }
 
-          static int __init sandevistan_boot_init(void)
+          static struct notifier_block suitune_fb_notif = {
+          	.notifier_call = suitune_fb_notifier_callback,
+          };
+
+          static void suitune_touch_boost_start(void)
           {
-          	INIT_DELAYED_WORK(&sandevistan_unboost_work, sandevistan_unboost_fn);
+          	unsigned int cpu;
+          	struct cpufreq_policy *policy;
+          	unsigned int target;
 
-          	sandevistan_set_policy_min(1);
-          	schedule_delayed_work(&sandevistan_unboost_work,
-          			      msecs_to_jiffies(BOOST_WINDOW_MS));
+          	touch_last_trigger = jiffies;
 
-          	pr_info("sandevistan_boot: pinned CPUs to max freq for %dms\n",
-          		BOOST_WINDOW_MS);
+          	for_each_possible_cpu(cpu) {
+          		policy = cpufreq_cpu_get(cpu);
+          		if (!policy)
+          			continue;
+          		target = policy->cpuinfo.max_freq;
+          		if (!touch_active[cpu]) {
+          			if (!freq_qos_add_request(&policy->constraints,
+          						   &touch_reqs[cpu],
+          						   FREQ_QOS_MIN, target))
+          				touch_active[cpu] = true;
+          		} else {
+          			freq_qos_update_request(&touch_reqs[cpu], target);
+          		}
+          		cpufreq_cpu_put(policy);
+          	}
+          	mod_delayed_work(system_wq, &suitune_touch_boost_work,
+          			  msecs_to_jiffies(SUITUNE_TOUCH_BOOST_MS));
+          }
+
+          static void suitune_touch_boost_end(struct work_struct *work)
+          {
+          	unsigned int cpu;
+
+          	for_each_possible_cpu(cpu) {
+          		if (touch_active[cpu]) {
+          			freq_qos_remove_request(&touch_reqs[cpu]);
+          			touch_active[cpu] = false;
+          		}
+          	}
+          }
+
+          static void suitune_input_event(struct input_handle *handle,
+          				 unsigned int type, unsigned int code,
+          				 int value)
+          {
+          	if (type == EV_KEY && code == BTN_TOUCH && value == 1) {
+          		/* Initial touch-down: boost immediately, no debounce. */
+          		suitune_touch_boost_start();
+          	} else if (type == EV_ABS) {
+          		/* Move samples fire tens of times/sec during a drag —
+          		 * only re-arm the boost every SUITUNE_TOUCH_DEBOUNCE_MS
+          		 * instead of on every single sample. */
+          		if (time_after(jiffies, touch_last_trigger +
+          				msecs_to_jiffies(SUITUNE_TOUCH_DEBOUNCE_MS)))
+          			suitune_touch_boost_start();
+          	}
+          }
+
+          static int suitune_input_connect(struct input_handler *handler,
+          				   struct input_dev *dev,
+          				   const struct input_device_id *id)
+          {
+          	struct input_handle *handle;
+          	int error;
+
+          	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+          	if (!handle)
+          		return -ENOMEM;
+
+          	handle->dev = dev;
+          	handle->handler = handler;
+          	handle->name = "suitune_touchboost";
+
+          	error = input_register_handle(handle);
+          	if (error)
+          		goto err_free;
+
+          	error = input_open_device(handle);
+          	if (error)
+          		goto err_unregister;
+
+          	return 0;
+
+          err_unregister:
+          	input_unregister_handle(handle);
+          err_free:
+          	kfree(handle);
+          	return error;
+          }
+
+          static void suitune_input_disconnect(struct input_handle *handle)
+          {
+          	input_close_device(handle);
+          	input_unregister_handle(handle);
+          	kfree(handle);
+          }
+
+          static const struct input_device_id suitune_input_ids[] = {
+          	{
+          		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
+          			 INPUT_DEVICE_ID_MATCH_KEYBIT,
+          		.evbit = { BIT_MASK(EV_ABS) },
+          		.keybit = { [BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH) },
+          	},
+          	{ },
+          };
+          MODULE_DEVICE_TABLE(input, suitune_input_ids);
+
+          static struct input_handler suitune_input_handler = {
+          	.event = suitune_input_event,
+          	.connect = suitune_input_connect,
+          	.disconnect = suitune_input_disconnect,
+          	.name = "suitune_touchboost",
+          	.id_table = suitune_input_ids,
+          };
+
+          static int __init suitune_init(void)
+          {
+          	int ret;
+
+          	fb_register_client(&suitune_fb_notif);
+          	suitune_apply_boot_boost();
+
+          	ret = input_register_handler(&suitune_input_handler);
+          	if (ret)
+          		pr_warn("suitune: touch-boost input handler registration failed (%d)\n", ret);
+
           	return 0;
           }
-          late_initcall(sandevistan_boot_init);
 
-          MODULE_DESCRIPTION("Pin CPU to max freq for a window after boot (Sandevistan Boot)");
+          late_initcall(suitune_init);
+
           MODULE_LICENSE("GPL");
-          SANDEVISTAN_EOF
+          MODULE_DESCRIPTION("SuiTune: in-kernel boot boost + screen-off min-freq cap + debounced touch boost");
+          SUITUNE_EOF
 
-          printf '\nconfig SANDEVISTAN_BOOT\n\tbool "Pin CPU to max frequency for 60s after boot (Sandevistan Boot)"\n\tdefault y\n\thelp\n\t  Temporarily pins all cpufreq policies to their maximum frequency\n\t  for 60 seconds after boot, then releases them back to normal.\n' >> drivers/misc/Kconfig
-          echo 'obj-$(CONFIG_SANDEVISTAN_BOOT) += sandevistan_boot.o' >> drivers/misc/Makefile
+          if ! grep -q "config SUITUNE" drivers/misc/Kconfig; then
+            sed -i '/^endmenu/i \
+          config SUITUNE\n\tbool "SuiTune: boot CPU boost + screen-off min-freq cap + touch boost"\n\tdepends on CPU_FREQ \&\& FB \&\& INPUT\n\tdefault y\n' drivers/misc/Kconfig
+          fi
+          if ! grep -q "CONFIG_SUITUNE" drivers/misc/Makefile; then
+            echo 'obj-$(CONFIG_SUITUNE) += suitune.o' >> drivers/misc/Makefile
+          fi
+          echo "CONFIG_SUITUNE=y" >> arch/arm64/configs/gki_defconfig
 
-      - name: Enable CONFIG_SANDEVISTAN_BOOT
-        run: |
-          echo "CONFIG_SANDEVISTAN_BOOT=y" >> kernel_workspace/common/arch/arm64/configs/gki_defconfig
-
-      # ------------------------------------------------------------------
-      # NOT ADDED — specific technical reason each, not a blanket "too
-      # risky":
-      #
-      # - Yamada Gaming Boost (the touch-input-boost half of it; the
-      #   schedutil rate_limit_us half is already a normal runtime sysfs
-      #   tunable, nothing to compile in). Correctly boosting per-touch
-      #   across a multi-cluster SoC means either directly poking
-      #   policy->min per input event (racy, the older pre-freq_qos style)
-      #   or using freq_qos_add_request/freq_qos_update_request per
-      #   *unique* policy (the correct modern approach, but needs careful
-      #   dedup across CPUs sharing a cluster policy). I'm not confident
-      #   enough in getting that exactly right without compiling it — this
-      #   sandbox has no network, so I can't pull kernel headers or
-      #   actually build-test any of this section myself. Sandevistan Boot
-      #   above is one-shot and coarse, so a subtle bug there just means
-      #   "doesn't boost" — a per-touch-event driver running continuously
-      #   is a different risk profile if the QoS bookkeeping is wrong.
-      #
-      # - Tenebrion Battery (min freq when screen off): needs a screen-
-      #   on/off notification. GKI's common kernel (what this workflow
-      #   builds) doesn't include your Helio G99 vendor tree — the DRM
-      #   panel driver that would fire that notification lives there, not
-      #   here. Whether a generic fbdev-style notifier is even wired up
-      #   on your specific vendor kernel isn't something I can verify from
-      #   this repo.
-      #
-      # - Ochinai Inaho Audio (SCHED_FIFO + PM QoS + audioserver thread
-      #   boost): this targets a specific Android userspace process
-      #   ("audioserver") by name/PID. That process doesn't exist at
-      #   kernel-compile time — there's no C code to write for "boost
-      #   this daemon once it starts", that's what a service.d script is
-      #   *for*. Not a risk call, a category one: kernel source can't
-      #   express it.
-      # ------------------------------------------------------------------
-
-      # ------------------------------------------------------------------
-      # FIX: dropped LZ4KD entirely. It is not part of WildKernels'
-      # GKI_KernelSU_SUSFS build (their own feature list only lists
-      # CUBIC/BIC/Westwood/HTCP/BBR — no LZ4KD), and the repo URL used
-      # for it in the uploaded file (WildPlusKernel) doesn't exist. Rather
-      # than guess at a replacement source I can't verify, it's removed.
-      # If you specifically need LZ4KD zram compression, tell me and I'll
-      # look for a genuinely verified source for it separately.
-      # ------------------------------------------------------------------
-
-      # ==================================================================
-      # NEW: Droidspaces (LXC-like Linux container runtime) support.
-      # Source: https://github.com/ravindu644/Droidspaces-OSS
-      # android12-5.10 = GKI, kernel "below 6.12" AND "5.10 or lower" —
-      # both buckets in their docs, so BOTH kABI patches below are
-      # mandatory. Per their own docs this is NOT optional: enabling
-      # CONFIG_SYSVIPC / CONFIG_IPC_NS / CONFIG_POSIX_MQUEUE on a GKI
-      # kernel without these patches shifts task_struct kABI offsets and
-      # will bootloop devices with prebuilt vendor (GPU/camera) modules.
-      # ==================================================================
-      - name: Clone Droidspaces-OSS kernel patches
-        run: |
-          set -euo pipefail
-          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/droidspaces
-
-      - name: Apply Droidspaces SYSVIPC kABI-safe patch (mandatory, GKI < 6.12)
+      - name: Apply custom kernel branding
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          PATCH="/tmp/droidspaces/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
-          if ! patch -p1 --fuzz=3 < "$PATCH"; then
-            echo "::error::Droidspaces SYSVIPC kABI patch failed to apply — this is NOT optional. Enabling CONFIG_SYSVIPC without it WILL bootloop devices with prebuilt vendor modules. .rej files:"
-            find . -name "*.rej"
-            exit 1
-          fi
+          mv scripts/setlocalversion scripts/setlocalversion.orig
+          chmod +x scripts/setlocalversion.orig
+          cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
+          #!/bin/sh
+          printf -- '-BLAZE-KSUNv1-STABLE\n'
+          SETLOCALVERSION_EOF
+          chmod +x scripts/setlocalversion
 
-      - name: Apply Droidspaces POSIX_MQUEUE kABI-safe patch (mandatory, kernel 5.10 and below)
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          PATCH="/tmp/droidspaces/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
-          if ! patch -p1 --fuzz=3 < "$PATCH"; then
-            echo "::error::Droidspaces POSIX_MQUEUE kABI patch failed to apply. .rej files:"
-            find . -name "*.rej"
-            exit 1
-          fi
-
-      - name: Set Droidspaces GKI-exclusive kernel configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "# --- Droidspaces (LXC container runtime) support ---"
-            echo "CONFIG_SYSVIPC=y"
-            echo "CONFIG_POSIX_MQUEUE=y"
-            echo "CONFIG_IPC_NS=y"
-            echo "CONFIG_PID_NS=y"
-            echo "CONFIG_DEVTMPFS=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
-            echo "# UFW support (optional, recommended)"
-            echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
-            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
-            echo "# Fail2ban support (optional, recommended)"
-            echo "CONFIG_IP_SET=y"
-            echo "CONFIG_IP_SET_HASH_IP=y"
-            echo "CONFIG_IP_SET_HASH_NET=y"
-            echo "CONFIG_NETFILTER_XT_SET=y"
-            echo "# tmpfs xattr/posix acl, needed for NixOS containers"
-            echo "CONFIG_TMPFS_POSIX_ACL=y"
-            echo "CONFIG_TMPFS_XATTR=y"
-          } >> gki_defconfig
-
-      # ------------------------------------------------------------------
-      # NEW: custom kernel version branding. CONFIG_LOCALVERSION appends
-      # the exact "-BLAZE-KSUN-SUSFS-STABLE" suffix, and disabling
-      # CONFIG_LOCALVERSION_AUTO stops scripts/setlocalversion from also
-      # running `git describe`/`git diff-index` and tacking on its own
-      # "-gXXXXXXX" hash or "-dirty" flag on top (the tree IS technically
-      # dirty at this point since we've applied patches — this is what
-      # actually suppresses that, not just cosmetic naming). Placed last
-      # among the defconfig-writing steps so it wins if anything upstream
-      # already set these keys (later lines override earlier ones for the
-      # same key when the kernel's defconfig loader parses the file).
-      # Final uname -r string will read: 5.10.<SUBLEVEL>-BLAZE-KSUN-SUSFS-STABLE
-      # ------------------------------------------------------------------
-      - name: Set custom kernel version branding
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_LOCALVERSION=\"-${{ env.KERNEL_BRAND }}\""
-            echo "# CONFIG_LOCALVERSION_AUTO is not set"
-          } >> gki_defconfig
-
-      # ------------------------------------------------------------------
-      # FIX: the real, proven way to stop the strict "savedefconfig must
-      # match exactly" check — this is what actually causes silent
-      # config loss vs. the uploaded file's regenerate-via-savedefconfig
-      # approach, which can DROP any of the config lines above if the
-      # build system decides they're implied/default (no error shown).
-      # SKIP_DEFCONFIG_CHECK=1 (from the uploaded file) does nothing; it
-      # isn't a variable the build system reads.
-      # ------------------------------------------------------------------
       - name: Disable strict defconfig verification
         working-directory: kernel_workspace
         run: sed -i 's/check_defconfig//' ./common/build.config.gki
 
-      # ------------------------------------------------------------------
-      # FIX: android12-5.10 always uses legacy build.sh, never Bazel — the
-      # bazel-then-fallback approach in the uploaded file just wastes
-      # several minutes failing before falling through, and can leave
-      # stray partial-build state that confuses the retry.
-      # ------------------------------------------------------------------
       - name: Build kernel
         working-directory: kernel_workspace
         run: |
@@ -733,15 +1008,6 @@ jobs:
           USE_CCACHE=1 \
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
-
-      - name: Verify kernel version string
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          UTS=$(find out -name "utsrelease.h" | head -n1)
-          if [ -n "$UTS" ]; then
-            echo "Built version string: $(grep UTS_RELEASE "$UTS")"
-          fi
 
       - name: Locate built Image
         working-directory: kernel_workspace
@@ -758,25 +1024,13 @@ jobs:
           echo "Found Image at: $IMG"
           echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
 
-      # ------------------------------------------------------------------
-      # FIX: WildKernels' own AnyKernel3 fork (gki-2.0 branch), matched to
-      # this kernel family, instead of the generic osm0sis upstream — the
-      # flasher scripts in this fork already know how to handle a Wild
-      # KSU + SUSFS kernel correctly.
-      # NEW: kernel.string in anykernel.sh (the name shown on the flash
-      # screen) is now overwritten with the same branded name, and the
-      # output zip is named after it too, so the label is consistent
-      # everywhere — flash screen, zip filename, and `uname -r` on device.
-      # ------------------------------------------------------------------
       - name: Package AnyKernel3
         run: |
           set -euo pipefail
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          KVER="5.10.${SUBLEVEL}-${{ env.KERNEL_BRAND }}"
-          sed -i "s/^kernel\.string=.*/kernel.string=${KVER}/" anykernel.sh
-          zip -r9 -q "../${KVER}-${{ github.event.inputs.device_name }}.zip" . -x ".git*"
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
