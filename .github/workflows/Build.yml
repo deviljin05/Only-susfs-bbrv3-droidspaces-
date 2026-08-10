@@ -19,6 +19,18 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 #    patches apply cleanly, to avoid a bootloop)
 #  - NTSync
 #  - Custom kernel branding (-BLAZE-KSUNv1-STABLE version suffix)
+#
+# NOTE ON CONFIG_NAMESPACES / CONFIG_NET_NS / CONFIG_CGROUPS:
+# These are already default-y on virtually all GKI android12-5.10
+# defconfigs, so explicitly forcing them below is a no-op in the normal
+# case. They were added back in on explicit user request. If a device's
+# on-device check (e.g. Termux "Requirements Check") still reports
+# CONFIG_USER_NS or any of these as disabled AFTER a build that this
+# workflow's own verification step confirms has them =y in the final
+# .config, that means a vendor/board config fragment is overriding the
+# value later in the boot chain (or the flashed image isn't actually
+# this build's Image) — that is not something a defconfig edit here can
+# fix, since it happens outside this workflow entirely.
 # ============================================================================
 
 on:
@@ -350,12 +362,17 @@ jobs:
       - name: Set Droidspaces (container runtime) configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
-          # This is exactly the GKI-Exclusive list from Droidspaces' own
-          # docs — deliberately not the longer Non-GKI list (raw
-          # CONFIG_NAMESPACES/CONFIG_CGROUPS/etc.), since upstream warns
-          # against enabling anything beyond this specific set on a GKI
-          # kernel: the rest is already on by default and adding more
-          # risks the same kind of kABI breakage the patches above fix.
+          # This is the GKI-Exclusive list from Droidspaces' own docs, plus
+          # CONFIG_NAMESPACES / CONFIG_NET_NS / CONFIG_CGROUPS added back in
+          # on explicit user request. Upstream Droidspaces docs note these
+          # three are already default-on for virtually every GKI defconfig,
+          # so forcing them here is normally a no-op — but they're harmless
+          # to force explicitly (they don't touch struct layout / kABI the
+          # way SYSVIPC/POSIX_MQUEUE do, so they don't need the kABI-safe
+          # patches above). SYSVIPC/POSIX_MQUEUE/IPC_NS remain gated on the
+          # kABI patches applying cleanly — that gating is NOT removed,
+          # since forcing those two specifically without the padding-slot
+          # patches is what actually causes a bootloop.
           if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
             {
               echo "CONFIG_SYSVIPC=y"
@@ -366,6 +383,9 @@ jobs:
             echo "::warning::Skipping CONFIG_SYSVIPC/CONFIG_POSIX_MQUEUE/CONFIG_IPC_NS — Droidspaces kABI patches did not apply cleanly this run."
           fi
           {
+            echo "CONFIG_NAMESPACES=y"
+            echo "CONFIG_NET_NS=y"
+            echo "CONFIG_CGROUPS=y"
             echo "CONFIG_PID_NS=y"
             echo "CONFIG_DEVTMPFS=y"
             echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
@@ -409,7 +429,7 @@ jobs:
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
 
-      - name: Verify CONFIG_USER_NS made it into the final .config
+      - name: Verify namespace / cgroup configs made it into the final .config
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -417,18 +437,24 @@ jobs:
           # actually matters is whatever ended up in the .config the build
           # produced, since a vendor/board fragment merged in later by
           # build.sh can silently override it. Fail loudly here instead of
-          # finding out from a "CONFIG_USER_NS disabled" check on-device.
+          # finding out from a "disabled" check on-device.
           CFG=$(find out -name ".config" | head -n1)
           if [ -z "$CFG" ]; then
             echo "::error::Could not find a compiled .config under kernel_workspace/out to verify"
             exit 1
           fi
           echo "Checking $CFG"
-          if grep -q '^CONFIG_USER_NS=y$' "$CFG"; then
-            echo "✓ CONFIG_USER_NS=y confirmed in final .config"
-          else
-            echo "::error::CONFIG_USER_NS is NOT enabled in the final .config — something downstream (vendor/board fragment) is overriding gki_defconfig. Actual line:"
-            grep -n 'CONFIG_USER_NS' "$CFG" || echo "(no CONFIG_USER_NS line found at all)"
+          FAILED="false"
+          for SYM in CONFIG_USER_NS CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS; do
+            if grep -q "^${SYM}=y$" "$CFG"; then
+              echo "✓ ${SYM}=y confirmed in final .config"
+            else
+              echo "::error::${SYM} is NOT enabled in the final .config — something downstream (vendor/board fragment) is overriding gki_defconfig. Actual line:"
+              grep -n "${SYM}" "$CFG" || echo "(no ${SYM} line found at all)"
+              FAILED="true"
+            fi
+          done
+          if [ "${FAILED}" = "true" ]; then
             exit 1
           fi
 
