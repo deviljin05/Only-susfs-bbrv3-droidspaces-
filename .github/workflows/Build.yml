@@ -33,15 +33,25 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 # touching it). If a device's on-device check reports it disabled,
 # that reflects the upstream defconfig/vendor fragment, not an
 # override this workflow used to make.
+#
+# NOTE ON SOURCE PINNING (os_patch_level):
+# 'lts' resolves to the rolling common-android12-5.10-lts branch (always
+# current, moves under you between runs). Anything else is treated as an
+# exact GKI release manifest tag (e.g. android12-5.10.264_r00) and is
+# checked out verbatim via `repo init -b <tag>` with NO common-<VERSION>-
+# prefix, since release tags and the rolling dev branch use different
+# naming schemes in kernel/manifest. Default below is pinned to the
+# android12-5.10.264 release build per explicit user request, so repeat
+# runs are reproducible until you change the input.
 # ============================================================================
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "Kernel branch tag — 'lts' tracks the rolling LTS branch (recommended, always current)"
+        description: "'lts' = rolling LTS branch. Or pin an exact GKI release tag, e.g. android12-5.10.264_r00"
         required: true
-        default: "lts"
+        default: "android12-5.10.264_r00"
       susfs_commit:
         description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch, i.e. latest SUSFS release)"
         required: false
@@ -91,11 +101,30 @@ jobs:
       - name: Set up ccache
         run: mkdir -p "${{ env.CCACHE_DIR }}"
 
+      - name: Resolve GKI manifest branch/tag to sync
+        id: resolve_ref
+        run: |
+          set -euo pipefail
+          INPUT="${{ github.event.inputs.os_patch_level }}"
+          if [ "${INPUT}" = "lts" ]; then
+            REF="common-${{ env.VERSION }}-lts"
+            echo "Tracking rolling LTS branch: ${REF}"
+          else
+            # Treat as an exact release manifest tag, e.g. android12-5.10.264_r00.
+            # Release tags are checked out as-is (no common-<VERSION>- prefix) —
+            # that prefix only applies to the rolling dev/lts branches.
+            REF="${INPUT}"
+            echo "Pinning to exact release tag: ${REF}"
+          fi
+          echo "REF=${REF}" >> "$GITHUB_ENV"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+
       - name: Sync GKI kernel source
         run: |
+          set -euo pipefail
           mkdir kernel_workspace && cd kernel_workspace
           repo init -u https://android.googlesource.com/kernel/manifest \
-            -b common-${{ env.VERSION }}-${{ github.event.inputs.os_patch_level }} --depth=1
+            -b "${REF}" --depth=1
           repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
 
       - name: Detect kernel sublevel
