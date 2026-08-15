@@ -36,11 +36,20 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 #
 # NOTE ON SOURCE PINNING (os_patch_level):
 # 'lts' resolves to the rolling common-android12-5.10-lts branch (always
-# current, moves under you between runs). Anything else is treated as an
-# exact GKI release manifest tag (e.g. android12-5.10.264_r00) and is
-# checked out verbatim via `repo init -b <tag>` with NO common-<VERSION>-
-# prefix, since release tags and the rolling dev branch use different
-# naming schemes in kernel/manifest. Default below is pinned to the
+# current, moves under you between runs).
+#
+# Anything else (e.g. android12-5.10.264_r00) is a GKI release TAG. That
+# tag lives on the kernel/common repo itself, NOT on kernel/manifest — so
+# it cannot be passed to `repo init -b`, which selects a branch/tag of the
+# *manifest* repo (this is what caused "couldn't find remote ref
+# refs/heads/android12-5.10.264_r00" — repo was looking for that ref on
+# kernel/manifest, where it doesn't exist). Instead: repo init/sync always
+# targets the normal common-android12-5.10[-lts] manifest branch (which
+# gives us kernel/common shallow-cloned at HEAD), and THEN, if a specific
+# tag was requested, we fetch and check out that exact tag inside
+# kernel_workspace/common directly against the kernel/common remote. This
+# pins the actual kernel source tree to that release regardless of what
+# the manifest's HEAD currently points to. Default below is pinned to the
 # android12-5.10.264 release build per explicit user request, so repeat
 # runs are reproducible until you change the input.
 # ============================================================================
@@ -101,31 +110,52 @@ jobs:
       - name: Set up ccache
         run: mkdir -p "${{ env.CCACHE_DIR }}"
 
-      - name: Resolve GKI manifest branch/tag to sync
-        id: resolve_ref
+      - name: Resolve manifest branch and optional pinned release tag
         run: |
           set -euo pipefail
           INPUT="${{ github.event.inputs.os_patch_level }}"
           if [ "${INPUT}" = "lts" ]; then
-            REF="common-${{ env.VERSION }}-lts"
-            echo "Tracking rolling LTS branch: ${REF}"
+            MANIFEST_REF="common-${{ env.VERSION }}-lts"
+            PIN_TAG=""
+            echo "Tracking rolling LTS branch: ${MANIFEST_REF}"
           else
-            # Treat as an exact release manifest tag, e.g. android12-5.10.264_r00.
-            # Release tags are checked out as-is (no common-<VERSION>- prefix) —
-            # that prefix only applies to the rolling dev/lts branches.
-            REF="${INPUT}"
-            echo "Pinning to exact release tag: ${REF}"
+            # INPUT (e.g. android12-5.10.264_r00) is a release TAG that lives
+            # on kernel/common, not a branch/tag of kernel/manifest. Sync the
+            # manifest's normal dev branch so repo/build tooling is present,
+            # then pin the common/ checkout to this exact tag afterward.
+            MANIFEST_REF="common-${{ env.VERSION }}"
+            PIN_TAG="${INPUT}"
+            echo "Manifest branch for sync: ${MANIFEST_REF}"
+            echo "Will pin kernel_workspace/common to release tag: ${PIN_TAG}"
           fi
-          echo "REF=${REF}" >> "$GITHUB_ENV"
-          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "MANIFEST_REF=${MANIFEST_REF}" >> "$GITHUB_ENV"
+          echo "PIN_TAG=${PIN_TAG}" >> "$GITHUB_ENV"
 
       - name: Sync GKI kernel source
         run: |
           set -euo pipefail
           mkdir kernel_workspace && cd kernel_workspace
           repo init -u https://android.googlesource.com/kernel/manifest \
-            -b "${REF}" --depth=1
+            -b "${MANIFEST_REF}" --depth=1
           repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
+
+      - name: Pin kernel/common to exact release tag (if requested)
+        if: ${{ env.PIN_TAG != '' }}
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          # repo-managed checkouts don't always name the remote "origin" —
+          # it's whatever the manifest's <remote> element defines (often
+          # "aosp" for AOSP kernel manifests). Detect it instead of assuming.
+          REMOTE_NAME="$(git remote | head -n1)"
+          if [ -z "${REMOTE_NAME}" ]; then
+            echo "::error::No git remote found in kernel_workspace/common — cannot fetch pinned tag"
+            exit 1
+          fi
+          echo "Using remote '${REMOTE_NAME}' to fetch tag ${PIN_TAG}"
+          git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
+          git checkout "refs/tags/${PIN_TAG}"
+          echo "Now on: $(git describe --tags --always) ($(git rev-parse HEAD))"
 
       - name: Detect kernel sublevel
         working-directory: kernel_workspace
