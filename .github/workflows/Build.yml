@@ -26,13 +26,10 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 # case. They were added back in on explicit user request.
 #
 # NOTE ON CONFIG_USER_NS:
-# Per user request, this build does NOT force CONFIG_USER_NS=y and it
-# has been removed from the verification step below. Whatever the
-# upstream GKI defconfig ships for CONFIG_USER_NS is left as-is (this
-# workflow does not flip it off explicitly either — it simply stops
-# touching it). If a device's on-device check reports it disabled,
-# that reflects the upstream defconfig/vendor fragment, not an
-# override this workflow used to make.
+# Per user request, this build now DOES force CONFIG_USER_NS=y (set
+# alongside the other namespace configs below, and included in the
+# post-build verification step) so that Droidspaces' "User namespace"
+# optional-feature check reports [✓] instead of [✗].
 #
 # NOTE ON SOURCE PINNING (os_patch_level):
 # 'lts' resolves to the rolling common-android12-5.10-lts branch (always
@@ -424,20 +421,19 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           # This is the GKI-Exclusive list from Droidspaces' own docs, plus
-          # CONFIG_NAMESPACES / CONFIG_NET_NS / CONFIG_CGROUPS added back in
-          # on explicit user request. Upstream Droidspaces docs note these
-          # three are already default-on for virtually every GKI defconfig,
-          # so forcing them here is normally a no-op — but they're harmless
-          # to force explicitly (they don't touch struct layout / kABI the
-          # way SYSVIPC/POSIX_MQUEUE do, so they don't need the kABI-safe
-          # patches above). SYSVIPC/POSIX_MQUEUE/IPC_NS remain gated on the
-          # kABI patches applying cleanly — that gating is NOT removed,
-          # since forcing those two specifically without the padding-slot
-          # patches is what actually causes a bootloop.
-          #
-          # CONFIG_USER_NS removed on request — this workflow no longer
-          # forces it either way; whatever the upstream defconfig ships is
-          # left untouched.
+          # CONFIG_NAMESPACES / CONFIG_NET_NS / CONFIG_CGROUPS / CONFIG_USER_NS
+          # added back in on explicit user request. Upstream Droidspaces docs
+          # note the first three are already default-on for virtually every
+          # GKI defconfig, so forcing them here is normally a no-op — but
+          # they're harmless to force explicitly (they don't touch struct
+          # layout / kABI the way SYSVIPC/POSIX_MQUEUE do, so they don't
+          # need the kABI-safe patches above). CONFIG_USER_NS is the same
+          # story: it does not shift task_struct layout either, so forcing
+          # it does not require the SYSVIPC/POSIX_MQUEUE kABI patches and is
+          # NOT gated behind DROIDSPACES_KABI_OK. SYSVIPC/POSIX_MQUEUE/IPC_NS
+          # remain gated on the kABI patches applying cleanly — that gating
+          # is NOT removed, since forcing those two specifically without the
+          # padding-slot patches is what actually causes a bootloop.
           if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
             {
               echo "CONFIG_SYSVIPC=y"
@@ -452,6 +448,7 @@ jobs:
             echo "CONFIG_NET_NS=y"
             echo "CONFIG_CGROUPS=y"
             echo "CONFIG_PID_NS=y"
+            echo "CONFIG_USER_NS=y"
             echo "CONFIG_DEVTMPFS=y"
             echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
             echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
@@ -502,8 +499,10 @@ jobs:
           # produced, since a vendor/board fragment merged in later by
           # build.sh can silently override it. Fail loudly here instead of
           # finding out from a "disabled" check on-device.
-          # NOTE: CONFIG_USER_NS is intentionally excluded from this check —
-          # this workflow no longer forces it, so it's not verified here.
+          # NOTE: CONFIG_USER_NS is now forced above, so it's included here
+          # too — a vendor/board fragment silently disabling it should also
+          # fail this check loudly rather than surface only as a Droidspaces
+          # on-device [✗].
           CFG=$(find out -name ".config" | head -n1)
           if [ -z "$CFG" ]; then
             echo "::error::Could not find a compiled .config under kernel_workspace/out to verify"
@@ -511,7 +510,7 @@ jobs:
           fi
           echo "Checking $CFG"
           FAILED="false"
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS; do
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS; do
             if grep -q "^${SYM}=y$" "$CFG"; then
               echo "✓ ${SYM}=y confirmed in final .config"
             else
