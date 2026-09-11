@@ -52,6 +52,9 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
 
       - name: Set up ccache
         run: mkdir -p "${{ env.CCACHE_DIR }}"
@@ -101,19 +104,46 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU
+      - name: Clone SUSFS4KSU (with retry + mirror fallback)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
+          BRANCH="gki-android12-5.10"
+          PRIMARY="https://gitlab.com/simonpunk/susfs4ksu.git"
+          MIRROR="https://github.com/WildKernels/susfs4ksu-mirror.git"
+
+          clone_with_retry() {
+            local url="$1"
+            for attempt in 1 2 3 4 5; do
+              echo "Attempt ${attempt}: cloning ${url}"
+              if git clone -b "${BRANCH}" --depth=1 "${url}" susfs4ksu; then
+                return 0
+              fi
+              echo "Clone failed (attempt ${attempt}), retrying in $((attempt*5))s..."
+              rm -rf susfs4ksu
+              sleep $((attempt*5))
+            done
+            return 1
+          }
+
+          if ! clone_with_retry "${PRIMARY}"; then
+            echo "::warning::Primary GitLab clone failed after retries (likely 409 rate-limit), trying mirror..."
+            if ! clone_with_retry "${MIRROR}"; then
+              echo "::error::Both primary and mirror clones of susfs4ksu failed"
+              exit 1
+            fi
+          fi
+
           cd susfs4ksu
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
+            git fetch --depth=1 origin "${{ github.event.inputs.susfs_commit }}" || true
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Copy SUSFS kernel patches
         run: |
+          set -euo pipefail
           cd kernel_workspace/common
           cp ../susfs4ksu/kernel_patches/fs/* ./fs/
           cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
@@ -155,7 +185,7 @@ jobs:
             sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's/^(\s+if \(inode\) \{)/$1\n\t\t\/\*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
+            perl -i -pe 's/^(\s+if \(inode\) \{)/$1\n\t\t\/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
             perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
@@ -163,6 +193,7 @@ jobs:
       - name: Apply SUSFS show_pad fix (older sublevels only)
         working-directory: kernel_workspace/common
         run: |
+          set -euo pipefail
           if [ "${SUBLEVEL}" -le "209" ]; then
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
@@ -176,6 +207,7 @@ jobs:
       - name: Bypass KernelSU Kbuild Check
         working-directory: kernel_workspace/common/drivers/kernelsu
         run: |
+          set -euo pipefail
           sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/# Bypass Kbuild check/g' Kbuild || true
 
       - name: Fix KernelSU-Next (static.patch)
@@ -272,9 +304,9 @@ jobs:
 
       - name: Inject configs to gki_defconfig
         run: |
+          set -euo pipefail
           cd kernel_workspace/common/arch/arm64/configs
-          
-          # SUSFS Configs
+
           echo "CONFIG_KSU=y" >> gki_defconfig
           echo "CONFIG_KSU_SUSFS=y" >> gki_defconfig
           echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> gki_defconfig
@@ -287,12 +319,10 @@ jobs:
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> gki_defconfig
           echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> gki_defconfig
 
-          # BBG
           if [ "${{ github.event.inputs.enable_bbg }}" = "true" ] && [ -d "../../../security/baseband_guard" ]; then
             echo "CONFIG_BBG=y" >> gki_defconfig
           fi
 
-          # TCP BBR
           echo "CONFIG_TCP_CONG_ADVANCED=y" >> gki_defconfig
           echo "CONFIG_TCP_CONG_BBR=y" >> gki_defconfig
           echo "CONFIG_TCP_CONG_CUBIC=y" >> gki_defconfig
@@ -307,10 +337,8 @@ jobs:
           echo "CONFIG_NET_SCH_FQ_CODEL=y" >> gki_defconfig
           echo "CONFIG_NET_SCH_CAKE=y" >> gki_defconfig
 
-          # NTSYNC
           echo "CONFIG_NTSYNC=y" >> gki_defconfig
 
-          # Droidspaces
           if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
             echo "CONFIG_SYSVIPC=y" >> gki_defconfig
             echo "CONFIG_POSIX_MQUEUE=y" >> gki_defconfig
@@ -355,11 +383,10 @@ jobs:
           set -euo pipefail
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
-          
-          # Force Clang toolchain stability across sub-makes
+
           export LLVM=1
           export LLVM_IAS=1
-          
+
           LTO=thin \
           BUILD_CONFIG=common/build.config.gki.aarch64 \
           USE_CCACHE=1 \
