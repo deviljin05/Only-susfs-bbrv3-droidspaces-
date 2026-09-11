@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "'lts' or exact tag, e.g. android12-5.10.264_r00"
+        description: "'lts' or exact GKI tag, e.g. android12-5.10.264_r00"
         required: true
         default: "android12-5.10.264_r00"
         type: string
@@ -16,7 +16,7 @@ on:
         type: string
 
       susfs_commit:
-        description: "Empty = latest commit from selected SUSFS branch"
+        description: "Empty = latest commit on selected SUSFS branch"
         required: false
         default: ""
         type: string
@@ -28,7 +28,7 @@ on:
         type: string
 
       device_name:
-        description: "Artifact/device name"
+        description: "Artifact name"
         required: true
         default: "gki-custom"
         type: string
@@ -47,7 +47,7 @@ env:
 
 jobs:
   build:
-    name: Build GKI Kernel
+    name: Build Custom GKI Kernel
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -95,7 +95,7 @@ jobs:
             wget \
             zip
 
-      - name: Configure Git and network
+      - name: Configure Git
         shell: bash
         run: |
           set -euo pipefail
@@ -153,8 +153,8 @@ jobs:
           echo "MANIFEST_REF=${MANIFEST_REF}" >> "${GITHUB_ENV}"
           echo "PIN_TAG=${PIN_TAG}" >> "${GITHUB_ENV}"
 
-          echo "Manifest branch: ${MANIFEST_REF}"
-          echo "Kernel tag: ${PIN_TAG:-not pinned}"
+          echo "Manifest: ${MANIFEST_REF}"
+          echo "Tag: ${PIN_TAG:-not pinned}"
 
       - name: Sync Android GKI source
         shell: bash
@@ -188,7 +188,7 @@ jobs:
           REMOTE_NAME="$(git remote | head -n1)"
 
           if [ -z "${REMOTE_NAME}" ]; then
-            echo "::error::No git remote found for kernel/common"
+            echo "::error::No remote found in kernel/common"
             exit 1
           fi
 
@@ -210,12 +210,12 @@ jobs:
           SUBLEVEL="$(awk '/^SUBLEVEL =/ {print $3; exit}' Makefile)"
 
           echo "Kernel version: ${KERNEL_VERSION}"
-          echo "Kernel sublevel: ${SUBLEVEL}"
+          echo "Sublevel: ${SUBLEVEL}"
 
           echo "KERNEL_VERSION=${KERNEL_VERSION}" >> "${GITHUB_ENV}"
           echo "SUBLEVEL=${SUBLEVEL}" >> "${GITHUB_ENV}"
 
-      - name: Clone latest SUSFS
+      - name: Clone SUSFS
         working-directory: kernel_workspace
         shell: bash
         run: |
@@ -249,7 +249,7 @@ jobs:
           done
 
           if [ "${CLONED}" != "true" ]; then
-            echo "::error::Could not clone SUSFS after retries"
+            echo "::error::SUSFS clone failed after retries"
             exit 1
           fi
 
@@ -262,35 +262,24 @@ jobs:
             git checkout --detach "${COMMIT}"
           fi
 
-          SELECTED_COMMIT="$(git rev-parse HEAD)"
+          SUSFS_COMMIT_VALUE="$(git rev-parse HEAD)"
 
           echo "SUSFS branch: ${BRANCH}"
-          echo "SUSFS commit: ${SELECTED_COMMIT}"
+          echo "SUSFS commit: ${SUSFS_COMMIT_VALUE}"
 
-          echo "SUSFS_COMMIT=${SELECTED_COMMIT}" >> "${GITHUB_ENV}"
+          echo "SUSFS_COMMIT=${SUSFS_COMMIT_VALUE}" >> "${GITHUB_ENV}"
 
-      - name: Validate SUSFS package
+      - name: Validate SUSFS files
         working-directory: kernel_workspace
         shell: bash
         run: |
           set -euo pipefail
 
-          SUSFS_ROOT="susfs4ksu/kernel_patches"
+          ROOT="susfs4ksu/kernel_patches"
 
-          if [ ! -d "${SUSFS_ROOT}/fs" ]; then
-            echo "::error::SUSFS fs patch directory missing"
-            exit 1
-          fi
-
-          if [ ! -d "${SUSFS_ROOT}/include/linux" ]; then
-            echo "::error::SUSFS include directory missing"
-            exit 1
-          fi
-
-          if [ ! -f "${SUSFS_ROOT}/50_add_susfs_in_gki-android12-5.10.patch" ]; then
-            echo "::error::Android 12 5.10 SUSFS patch missing"
-            exit 1
-          fi
+          test -d "${ROOT}/fs"
+          test -d "${ROOT}/include/linux"
+          test -f "${ROOT}/50_add_susfs_in_gki-android12-5.10.patch"
 
       - name: Copy SUSFS files
         working-directory: kernel_workspace
@@ -298,16 +287,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          SUSFS_ROOT="susfs4ksu/kernel_patches"
+          ROOT="susfs4ksu/kernel_patches"
 
-          cp -a "${SUSFS_ROOT}/fs/." common/fs/
-          cp -a "${SUSFS_ROOT}/include/linux/." common/include/linux/
+          cp -a "${ROOT}/fs/." common/fs/
+          cp -a "${ROOT}/include/linux/." common/include/linux/
 
           cp -a \
-            "${SUSFS_ROOT}/50_add_susfs_in_gki-android12-5.10.patch" \
+            "${ROOT}/50_add_susfs_in_gki-android12-5.10.patch" \
             common/50_add_susfs_in_gki-android12-5.10.patch
 
-      - name: Apply Android 12 5.10 compatibility fixes
+      - name: Apply Android 12 5.10 compatibility preparation
         working-directory: kernel_workspace/common
         shell: bash
         run: |
@@ -333,26 +322,47 @@ jobs:
               fs/notify/fdinfo.c
           fi
 
-      - name: Apply SUSFS patch strictly
+      - name: Clean patch backup files
+        working-directory: kernel_workspace/common
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find . \
+            \( -name '*.orig' -o -name '*.rej' \) \
+            -type f \
+            -delete
+
+      - name: Apply SUSFS patch without orig backups
         working-directory: kernel_workspace/common
         shell: bash
         run: |
           set -euo pipefail
 
           patch \
+            --no-backup-if-mismatch \
             --batch \
             --forward \
-            --fuzz=0 \
+            --fuzz=3 \
             -p1 \
             < 50_add_susfs_in_gki-android12-5.10.patch
 
-          if find . \( -name '*.rej' -o -name '*.orig' \) | grep -q .; then
-            echo "::error::SUSFS patch generated rejected files"
-            find . \( -name '*.rej' -o -name '*.orig' \)
+          REJECTS="$(find . -type f -name '*.rej' | head -n1 || true)"
+
+          if [ -n "${REJECTS}" ]; then
+            echo "::error::SUSFS patch generated rejected hunks"
+            find . -type f -name '*.rej'
             exit 1
           fi
 
-      - name: Fix SUSFS nameidata compatibility
+          find . \
+            \( -name '*.orig' -o -name '*.rej' \) \
+            -type f \
+            -delete
+
+          echo "SUSFS patch applied successfully"
+
+      - name: Fix SUSFS nameidata mismatch
         working-directory: kernel_workspace/common
         shell: bash
         run: |
@@ -362,7 +372,7 @@ jobs:
             's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' \
             fs/namei.c
 
-      - name: Apply SUSFS old sublevel compatibility fixes
+      - name: Apply old sublevel fixes
         working-directory: kernel_workspace/common
         shell: bash
         run: |
@@ -381,19 +391,13 @@ jobs:
           set -euo pipefail
 
           FUNC="susfs_sus_kstat_spoof_vfs_statfs"
-          SOURCE="fs/statfs.c"
-
-          if [ ! -f "${SOURCE}" ]; then
-            echo "::error::fs/statfs.c not found"
-            exit 1
-          fi
 
           if ! grep -Rqs \
             --include='*.c' \
             --include='*.h' \
             "${FUNC}" \
             fs include security drivers; then
-            echo "::error::SUSFS statfs helper is absent"
+            echo "::error::SUSFS statfs helper missing"
             exit 1
           fi
 
@@ -406,22 +410,18 @@ jobs:
           )"
 
           if [ -z "${DECL_FILE}" ]; then
-            echo "::error::SUSFS statfs declaration/header is missing"
-            echo "::error::SUSFS files and patch are from incompatible revisions"
-            grep -Rns "${FUNC}" fs include security drivers || true
+            echo "::error::SUSFS statfs declaration missing"
             exit 1
           fi
 
           HEADER="${DECL_FILE#./}"
           HEADER="${HEADER#include/}"
 
-          if ! grep -qF "#include <${HEADER}>" "${SOURCE}"; then
-            sed -i "1i#include <${HEADER}>" "${SOURCE}"
+          if ! grep -qF "#include <${HEADER}>" fs/statfs.c; then
+            sed -i "1i#include <${HEADER}>" fs/statfs.c
           fi
 
-          echo "SUSFS statfs declaration found in: ${DECL_FILE}"
-
-      - name: Setup latest KernelSU-Next
+      - name: Setup KernelSU-Next
         working-directory: kernel_workspace/common
         shell: bash
         run: |
@@ -442,21 +442,18 @@ jobs:
           chmod +x /tmp/ksu-setup.sh
           bash /tmp/ksu-setup.sh "${KSU_BRANCH}"
 
-      - name: Validate KernelSU-Next
+      - name: Validate KernelSU
         working-directory: kernel_workspace/common
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -d drivers/kernelsu ]; then
-            echo "::error::drivers/kernelsu was not created"
-            exit 1
-          fi
+          test -d drivers/kernelsu
 
-          if ! grep -Rqs "config KSU" drivers/kernelsu; then
-            echo "::error::KernelSU Kconfig was not installed"
+          grep -Rqs "config KSU" drivers/kernelsu || {
+            echo "::error::KernelSU Kconfig not found"
             exit 1
-          fi
+          }
 
       - name: Install Baseband Guard
         if: ${{ inputs.enable_bbg == true }}
@@ -475,7 +472,7 @@ jobs:
           bash /tmp/baseband-guard-setup.sh
 
           if [ ! -d common/security/baseband-guard ]; then
-            echo "::error::common/security/baseband-guard was not created"
+            echo "::error::Baseband Guard directory not found"
             find common/security -maxdepth 2 -iname '*baseband*' -print
             exit 1
           fi
@@ -483,7 +480,7 @@ jobs:
           sed -i 's/[[:space:]]-Werror//g' \
             common/security/baseband-guard/Makefile || true
 
-      - name: Integrate Baseband Guard Kconfig
+      - name: Configure Baseband Guard LSM
         if: ${{ inputs.enable_bbg == true }}
         working-directory: kernel_workspace
         shell: bash
@@ -492,20 +489,8 @@ jobs:
 
           KCONFIG="common/security/Kconfig"
 
-          if [ ! -f "${KCONFIG}" ]; then
-            echo "::error::${KCONFIG} not found"
-            exit 1
-          fi
-
-          if [ ! -d common/security/baseband-guard ]; then
-            echo "::error::Baseband Guard directory missing"
-            exit 1
-          fi
-
-          if ! grep -q "baseband_guard" "${KCONFIG}"; then
-            echo "::error::baseband_guard entry is missing in security/Kconfig"
-            exit 1
-          fi
+          test -f "${KCONFIG}"
+          grep -q "baseband_guard" "${KCONFIG}"
 
           python3 - "${KCONFIG}" <<'PY'
           from pathlib import Path
@@ -515,19 +500,19 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          block_match = re.search(
+          match = re.search(
               r'config\s+LSM\b.*?(?=\nconfig\s+|\Z)',
               text,
               re.S,
           )
 
-          if not block_match:
+          if not match:
               raise SystemExit("CONFIG_LSM block not found")
 
-          block = block_match.group(0)
+          block = match.group(0)
 
           if "baseband_guard" in block:
-              print("baseband_guard already exists in CONFIG_LSM")
+              print("baseband_guard already present in CONFIG_LSM")
               raise SystemExit(0)
 
           patterns = [
@@ -536,15 +521,12 @@ jobs:
           ]
 
           for pattern in patterns:
-              match = re.search(pattern, block, re.M)
+              found = re.search(pattern, block, re.M)
 
-              if not match:
+              if not found:
                   continue
 
-              old_value = match.group(2)
-
-              if "selinux" not in old_value:
-                  continue
+              old_value = found.group(2)
 
               new_value = old_value.replace(
                   "selinux",
@@ -553,18 +535,16 @@ jobs:
               )
 
               new_block = (
-                  block[:match.start(2)]
+                  block[:found.start(2)]
                   + new_value
-                  + block[match.end(2):]
+                  + block[found.end(2):]
               )
 
               path.write_text(text.replace(block, new_block, 1))
-              print("Added baseband_guard to CONFIG_LSM")
+              print("baseband_guard added to CONFIG_LSM")
               break
           else:
-              raise SystemExit(
-                  "Could not modify CONFIG_LSM default automatically"
-              )
+              raise SystemExit("Could not update CONFIG_LSM")
           PY
 
       - name: Apply BBRv3 when compatible
@@ -583,21 +563,26 @@ jobs:
           BBR_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
 
           if [ ! -f "${BBR_PATCH}" ]; then
-            echo "BBRv3 patch not found; normal BBR will be used"
+            echo "BBRv3 patch unavailable; regular BBR will be used"
             echo "BBRV3_PATCH_APPLIED=false" >> "${GITHUB_ENV}"
             exit 0
           fi
 
           if patch \
+            --no-backup-if-mismatch \
             --batch \
             --forward \
             --fuzz=0 \
-            -p1 < "${BBR_PATCH}"; then
-            echo "BBRv3 patch applied"
+            -p1 \
+            < "${BBR_PATCH}"; then
+            echo "BBRv3 applied"
             echo "BBRV3_PATCH_APPLIED=true" >> "${GITHUB_ENV}"
           else
-            echo "::warning::BBRv3 does not match this GKI source"
-            find . -name '*.rej' -delete
+            echo "::warning::BBRv3 is incompatible with this GKI tag"
+            find . \
+              \( -name '*.orig' -o -name '*.rej' \) \
+              -type f \
+              -delete
             echo "BBRV3_PATCH_APPLIED=false" >> "${GITHUB_ENV}"
           fi
 
@@ -611,45 +596,53 @@ jobs:
             curl -fL \
               --retry 8 \
               --retry-all-errors \
-              -o /tmp/0003-lockdep-assert-none-held.patch \
+              -o /tmp/ntsync-lockdep.patch \
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
 
             patch \
+              --no-backup-if-mismatch \
               --batch \
               --forward \
               --fuzz=0 \
               -p1 \
-              < /tmp/0003-lockdep-assert-none-held.patch \
-              || echo "::warning::NTSYNC lockdep patch not required"
+              < /tmp/ntsync-lockdep.patch \
+              || echo "::warning::NTSYNC lockdep patch skipped"
           fi
 
           curl -fL \
             --retry 8 \
             --retry-all-errors \
-            -o /tmp/ntsync_compat_android12-5.10.patch \
+            -o /tmp/ntsync-compat.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
 
           patch \
+            --no-backup-if-mismatch \
             --batch \
             --forward \
             --fuzz=0 \
             -p1 \
-            < /tmp/ntsync_compat_android12-5.10.patch \
-            || echo "::warning::NTSYNC compatibility patch did not apply"
+            < /tmp/ntsync-compat.patch \
+            || echo "::warning::NTSYNC compatibility patch skipped"
 
           curl -fL \
             --retry 8 \
             --retry-all-errors \
-            -o /tmp/ntsync_base.patch \
+            -o /tmp/ntsync-base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
 
           patch \
+            --no-backup-if-mismatch \
             --batch \
             --forward \
             --fuzz=0 \
             -p1 \
-            < /tmp/ntsync_base.patch \
-            || echo "::warning::NTSYNC base patch did not apply"
+            < /tmp/ntsync-base.patch \
+            || echo "::warning::NTSYNC base patch skipped"
+
+          find . \
+            \( -name '*.orig' -o -name '*.rej' \) \
+            -type f \
+            -delete
 
       - name: Apply Droidspaces KABI patches
         working-directory: kernel_workspace/common
@@ -662,36 +655,43 @@ jobs:
           curl -fL \
             --retry 8 \
             --retry-all-errors \
-            -o /tmp/droidspaces_sysvipc.patch \
+            -o /tmp/droidspaces-sysvipc.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
 
           if ! patch \
+            --no-backup-if-mismatch \
             --batch \
             --forward \
             --fuzz=0 \
             -p1 \
-            < /tmp/droidspaces_sysvipc.patch; then
-            echo "::warning::SYSVIPC KABI patch did not apply"
+            < /tmp/droidspaces-sysvipc.patch; then
+            echo "::warning::SYSVIPC patch skipped"
             DROIDSPACES_OK="false"
           fi
 
           curl -fL \
             --retry 8 \
             --retry-all-errors \
-            -o /tmp/droidspaces_posix_mqueue.patch \
+            -o /tmp/droidspaces-mqueue.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
 
           if ! patch \
+            --no-backup-if-mismatch \
             --batch \
             --forward \
             --fuzz=0 \
             -p1 \
-            < /tmp/droidspaces_posix_mqueue.patch; then
-            echo "::warning::POSIX_MQUEUE KABI patch did not apply"
+            < /tmp/droidspaces-mqueue.patch; then
+            echo "::warning::POSIX_MQUEUE patch skipped"
             DROIDSPACES_OK="false"
           fi
 
           echo "DROIDSPACES_KABI_OK=${DROIDSPACES_OK}" >> "${GITHUB_ENV}"
+
+          find . \
+            \( -name '*.orig' -o -name '*.rej' \) \
+            -type f \
+            -delete
 
       - name: Inject kernel configuration
         working-directory: kernel_workspace/common
@@ -759,19 +759,21 @@ jobs:
           target = Path(sys.argv[1])
           additions = Path(sys.argv[2]).read_text().splitlines()
 
-          values = {}
+          symbols = {}
 
           for line in target.read_text().splitlines():
               if line.startswith("CONFIG_") and "=" in line:
                   key = line.split("=", 1)[0]
-                  values[key] = line
+                  symbols[key] = line
 
           for line in additions:
               if line.startswith("CONFIG_") and "=" in line:
                   key = line.split("=", 1)[0]
-                  values[key] = line
+                  symbols[key] = line
 
-          target.write_text("\n".join(values.values()) + "\n")
+          target.write_text(
+              "\n".join(symbols.values()) + "\n"
+          )
           PY
 
           rm -f "${TMP}"
@@ -865,7 +867,7 @@ jobs:
             exit "${BUILD_STATUS}"
           fi
 
-      - name: Verify final kernel configuration
+      - name: Verify final configuration
         working-directory: kernel_workspace
         shell: bash
         run: |
@@ -952,7 +954,7 @@ jobs:
             -x '.git/*' \
             -x '.gitignore'
 
-      - name: Upload build artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.device_name }}-build
