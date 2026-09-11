@@ -163,11 +163,14 @@ jobs:
             exit 1
           fi
           
-          # Inject missing header definitions to resolve the implicit function compilation error
+          # Inject core kernel requirements followed by the SUSFS header at the absolute top of fs/statfs.c
           if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
             sed -i '1i #include <linux/susfs.h>' fs/statfs.c
-            echo "✓ Force-injected susfs.h into fs/statfs.c"
+            sed -i '1i #include <linux/uidgid.h>' fs/statfs.c
+            sed -i '1i #include <linux/cred.h>' fs/statfs.c
+            echo "✓ Force-injected headers in correct order into fs/statfs.c"
           fi
+
 
 
       - name: Ensure susfs.h include present in patched fs/*.c files
