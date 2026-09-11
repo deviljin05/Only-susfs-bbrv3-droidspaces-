@@ -163,6 +163,26 @@ jobs:
             exit 1
           fi
           
+          # Inject headers and explicitly declare the function to prevent macro expansion issues
+          if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
+            sed -i '1i int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, int is_fuse);' fs/statfs.c
+            sed -i '1i #include <linux/susfs.h>' fs/statfs.c
+            sed -i '1i #include <linux/uidgid.h>' fs/statfs.c
+            sed -i '1i #include <linux/cred.h>' fs/statfs.c
+            echo "✓ Force-injected headers and forward declaration into fs/statfs.c"
+          fi
+
+          
+          # Inject headers and explicitly declare the function to prevent macro expansion issues
+          if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
+            sed -i '1i int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, int is_fuse);' fs/statfs.c
+            sed -i '1i #include <linux/susfs.h>' fs/statfs.c
+            sed -i '1i #include <linux/uidgid.h>' fs/statfs.c
+            sed -i '1i #include <linux/cred.h>' fs/statfs.c
+            echo "✓ Force-injected headers and forward declaration into fs/statfs.c"
+          fi
+
+          
           # Inject core kernel requirements followed by the SUSFS header at the absolute top of fs/statfs.c
           if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
             sed -i '1i #include <linux/susfs.h>' fs/statfs.c
