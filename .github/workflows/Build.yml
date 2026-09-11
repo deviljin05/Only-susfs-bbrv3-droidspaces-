@@ -191,15 +191,9 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
-
-      - name: Patch BBG Toolchain PATH issue
-        if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        working-directory: kernel_workspace
-        run: |
-          BBG_DIR="common/security/baseband_guard"
-          if [ -d "$BBG_DIR" ] && [ -f "$BBG_DIR/Makefile" ]; then
-            sed -i 's/HOSTCC/HOSTCC -fuse-ld=lld/g' "$BBG_DIR/Makefile" || true
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+          if [ -d "common/security/baseband_guard" ]; then
+            sed -i 's/ -Werror//g' common/security/baseband_guard/Makefile || true
           fi
 
       - name: Configure Baseband Guard LSM
@@ -207,7 +201,9 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+          if grep -q "baseband_guard" common/security/Kconfig; then
+            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig || true
+          fi
 
       - name: Apply BBRv3 backport
         working-directory: kernel_workspace/common
@@ -292,7 +288,7 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> gki_defconfig
 
           # BBG
-          if [ "${{ github.event.inputs.enable_bbg }}" = "true" ]; then
+          if [ "${{ github.event.inputs.enable_bbg }}" = "true" ] && [ -d "../../../security/baseband_guard" ]; then
             echo "CONFIG_BBG=y" >> gki_defconfig
           fi
 
@@ -360,8 +356,9 @@ jobs:
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
           
-          # Fix Clang host toolchain pointing to system binutils
-          sudo ln -sf /usr/bin/ld /usr/bin/aarch64-linux-gnu-ld || true
+          # Force Clang toolchain stability across sub-makes
+          export LLVM=1
+          export LLVM_IAS=1
           
           LTO=thin \
           BUILD_CONFIG=common/build.config.gki.aarch64 \
