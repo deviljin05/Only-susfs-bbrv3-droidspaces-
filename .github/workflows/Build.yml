@@ -195,10 +195,11 @@ jobs:
 
       - name: Patch BBG Toolchain PATH issue
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        working-directory: kernel_workspace/common/security/baseband_guard
+        working-directory: kernel_workspace
         run: |
-          if [ -f "Makefile" ]; then
-            sed -i 's/HOSTCC/HOSTCC -fuse-ld=lld/g' Makefile || true
+          BBG_DIR="common/security/baseband_guard"
+          if [ -d "$BBG_DIR" ] && [ -f "$BBG_DIR/Makefile" ]; then
+            sed -i 's/HOSTCC/HOSTCC -fuse-ld=lld/g' "$BBG_DIR/Makefile" || true
           fi
 
       - name: Configure Baseband Guard LSM
