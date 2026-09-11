@@ -12,6 +12,18 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 # (input notifier → short freq_qos MIN boost on touch), wired the same
 # way as the existing SuiTune boot-boost/screen-off driver. Also added
 # IO scheduler forced to "none" (only mq-none built in, others disabled).
+#
+# FIX (this revision): the SUSFS patch can add calls like
+# susfs_sus_kstat_spoof_vfs_statfs() to fs/statfs.c without the matching
+# `#include <linux/susfs.h>` surviving the --fuzz=3 apply (kernel source
+# has drifted slightly from what the patch hunk expects around the top
+# of the file). That produced:
+#   fs/statfs.c:88:7: error: implicit declaration of function
+#   'susfs_sus_kstat_spoof_vfs_statfs' [-Werror,-Wimplicit-function-declaration]
+# Added a defensive step right after the SUSFS patch apply that checks
+# every susfs-touched fs/*.c file for the missing include and inserts it
+# (after the existing includes, so susfs.h's own type dependencies like
+# struct dentry/kstatfs are already visible) if it's not there.
 # ============================================================================
 
 on:
@@ -143,6 +155,36 @@ jobs:
             exit 1
           fi
 
+      - name: Ensure susfs.h include present in patched fs/*.c files
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          # The SUSFS patch (esp. under --fuzz=3 against slightly drifted
+          # kernel source) can land a call to a susfs_* function in a file
+          # without its matching `#include <linux/susfs.h>` surviving the
+          # hunk apply, producing implicit-declaration -Werror failures
+          # (e.g. susfs_sus_kstat_spoof_vfs_statfs in fs/statfs.c).
+          # Scan every fs/*.c file that now calls a susfs_* symbol and make
+          # sure the include is present, inserting it after the file's
+          # existing #include block (not before) so susfs.h's own type
+          # dependencies, like struct dentry/kstatfs, are already visible.
+          for f in fs/statfs.c fs/stat.c fs/open.c fs/namei.c fs/readdir.c; do
+            [ -f "$f" ] || continue
+            if grep -q 'susfs_' "$f" && ! grep -q '#include <linux/susfs.h>' "$f"; then
+              echo "Inserting missing #include <linux/susfs.h> into $f"
+              awk '
+                /^#include/ { last=NR }
+                { lines[NR]=$0 }
+                END {
+                  for (i=1;i<=NR;i++) {
+                    print lines[i]
+                    if (i==last) print "#include <linux/susfs.h>"
+                  }
+                }
+              ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            fi
+          done
+
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
         run: |
@@ -157,7 +199,7 @@ jobs:
             sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's/^(\s+if \(inode\) \{)/$1\n\t\t\/\*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
+            perl -i -pe 's/^(\s+if \(inode\) \{)/$1\n\t\t\/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
             perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
