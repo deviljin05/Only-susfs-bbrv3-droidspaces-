@@ -127,10 +127,18 @@ jobs:
 
       - name: Copy SUSFS kernel patches
         run: |
-          cd kernel_workspace/common
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
+          cd kernel_workspace
+          # Ensure directories exist
+          mkdir -p common/include/linux
+          mkdir -p common/fs
+          
+          # Copy headers and source files directly into the common tree
+          cp susfs4ksu/kernel_patches/include/linux/* common/include/linux/
+          cp susfs4ksu/kernel_patches/fs/* common/fs/
+          
+          # Copy the patch file over
+          cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch common/
+
 
       - name: Apply android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
@@ -154,6 +162,13 @@ jobs:
             find . -name "*.rej"
             exit 1
           fi
+          
+          # Inject missing header definitions to resolve the implicit function compilation error
+          if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
+            sed -i '1i #include <linux/susfs.h>' fs/statfs.c
+            echo "✓ Force-injected susfs.h into fs/statfs.c"
+          fi
+
 
       - name: Ensure susfs.h include present in patched fs/*.c files
         working-directory: kernel_workspace/common
