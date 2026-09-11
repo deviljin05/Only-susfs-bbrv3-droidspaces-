@@ -1,445 +1,656 @@
-name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
+name: Build Custom GKI Kernel
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "'lts' = rolling LTS branch. Or pin an exact GKI release tag, e.g. android12-5.10.264_r00"
+        description: "GKI release tag, for example android12-5.10.233_r00"
         required: true
         default: "android12-5.10.264_r00"
-      susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+
+      susfs_branch:
+        description: "SUSFS branch; leave empty for latest Android 12 5.10 branch"
         required: false
         default: ""
-      device_name:
-        description: "Optional label for artifact naming"
+
+      susfs_commit:
+        description: "Optional SUSFS commit; leave empty for latest"
         required: false
-        default: "gki-custom"
-      enable_bbg:
-        description: "Enable Baseband Guard (BBG)"
+        default: ""
+
+      ksu_branch:
+        description: "KernelSU-Next branch; leave empty for latest dev-susfs"
+        required: false
+        default: ""
+
+      device_name:
+        description: "Artifact/device label"
         required: true
-        default: "true"
+        default: "gki-custom"
+
+      enable_bbg:
+        description: "Enable Baseband Guard only after its integration is confirmed"
+        required: true
+        default: "false"
 
 env:
   VERSION: android12-5.10
   CCACHE_DIR: /home/runner/.ccache
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  KSU_SETUP_URL: https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    timeout-minutes: 180
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free up disk space
+      - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
           sudo apt-get clean
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl bc bison flex libssl-dev \
-            build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler binutils lld clang
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            clang \
+            curl \
+            device-tree-compiler \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            pahole \
+            perl \
+            python3 \
+            python3-pip \
+            rsync \
+            unzip \
+            wget \
+            zip
 
-      - name: Install repo tool
+      - name: Configure Git/network
         run: |
-          mkdir -p ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-          chmod a+x ~/bin/repo
-          echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global http.postBuffer 524288000
           git config --global http.lowSpeedLimit 0
           git config --global http.lowSpeedTime 999999
+          git config --global protocol.version 2
 
-      - name: Set up ccache
-        run: mkdir -p "${{ env.CCACHE_DIR }}"
-
-      - name: Resolve manifest branch and optional pinned release tag
+      - name: Install repo tool
         run: |
           set -euo pipefail
+          mkdir -p "${HOME}/bin"
+          curl -fL --retry 5 --retry-all-errors \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "${HOME}/bin/repo"
+          chmod +x "${HOME}/bin/repo"
+          echo "${HOME}/bin" >> "${GITHUB_PATH}"
+
+      - name: Configure ccache
+        run: |
+          set -euo pipefail
+          mkdir -p "${CCACHE_DIR}"
+          ccache --set-config=cache_dir="${CCACHE_DIR}"
+          ccache --set-config=max_size=8G
+          ccache --zero-stats
+
+      - name: Resolve GKI manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
           INPUT="${{ github.event.inputs.os_patch_level }}"
-          if [ "${INPUT}" = "lts" ]; then
-            MANIFEST_REF="common-${{ env.VERSION }}-lts"
-            PIN_TAG=""
-            echo "Tracking rolling LTS branch: ${MANIFEST_REF}"
-          else
-            MANIFEST_REF="common-${{ env.VERSION }}"
-            PIN_TAG="${INPUT}"
-            echo "Manifest branch for sync: ${MANIFEST_REF}"
-            echo "Will pin kernel_workspace/common to release tag: ${PIN_TAG}"
-          fi
-          echo "MANIFEST_REF=${MANIFEST_REF}" >> "$GITHUB_ENV"
-          echo "PIN_TAG=${PIN_TAG}" >> "$GITHUB_ENV"
 
-      - name: Sync GKI kernel source
+          if [ "${INPUT}" = "lts" ]; then
+            MANIFEST_REF="common-${VERSION}-lts"
+            PIN_TAG=""
+          else
+            MANIFEST_REF="common-${VERSION}"
+            PIN_TAG="${INPUT}"
+          fi
+
+          {
+            echo "MANIFEST_REF=${MANIFEST_REF}"
+            echo "PIN_TAG=${PIN_TAG}"
+          } >> "${GITHUB_ENV}"
+
+          echo "MANIFEST_REF=${MANIFEST_REF}"
+          echo "PIN_TAG=${PIN_TAG}"
+
+      - name: Sync Android GKI source
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir kernel_workspace && cd kernel_workspace
-          repo init -u https://android.googlesource.com/kernel/manifest \
-            -b "${MANIFEST_REF}" --depth=1
-          repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
 
-      - name: Pin kernel/common to exact release tag (if requested)
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${MANIFEST_REF}" \
+            --depth=1
+
+          repo sync \
+            -c \
+            --current-branch \
+            --no-clone-bundle \
+            --no-tags \
+            -j"$(nproc)"
+
+      - name: Pin kernel/common release tag
         if: ${{ env.PIN_TAG != '' }}
         working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          REMOTE_NAME="$(git remote | head -n1)"
-          if [ -z "${REMOTE_NAME}" ]; then
-            echo "::error::No git remote found in kernel_workspace/common"
-            exit 1
+
+          REMOTE="$(git remote | head -n1)"
+
+          git fetch \
+            --no-tags \
+            --depth=1 \
+            "${REMOTE}" \
+            "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
+
+          git checkout --detach "refs/tags/${PIN_TAG}"
+
+      - name: Detect kernel version
+        working-directory: kernel_workspace/common
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION_STRING="$(make -s kernelversion)"
+          SUBLEVEL="$(awk '/^SUBLEVEL =/ { print $3; exit }' Makefile)"
+
+          echo "Kernel version: ${VERSION_STRING}"
+          echo "Sublevel: ${SUBLEVEL}"
+
+          {
+            echo "KERNEL_VERSION=${VERSION_STRING}"
+            echo "SUBLEVEL=${SUBLEVEL}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Clone SUSFS latest branch
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRIMARY="${SUSFS_REPO}"
+          BRANCH="${{ github.event.inputs.susfs_branch }}"
+
+          if [ -z "${BRANCH}" ]; then
+            BRANCH="gki-android12-5.10"
           fi
-          git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
-          git checkout "refs/tags/${PIN_TAG}"
 
-      - name: Detect kernel sublevel
-        working-directory: kernel_workspace
-        run: |
-          SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
-          echo "Detected SUBLEVEL: $SUBLEVEL"
-          echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
+          clone_susfs() {
+            rm -rf susfs4ksu
 
-      - name: Clone SUSFS4KSU (with retry + mirror fallback)
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          BRANCH="gki-android12-5.10"
-          PRIMARY="https://gitlab.com/simonpunk/susfs4ksu.git"
-          MIRROR="https://github.com/WildKernels/susfs4ksu-mirror.git"
-
-          clone_with_retry() {
-            local url="$1"
             for attempt in 1 2 3 4 5; do
-              echo "Attempt ${attempt}: cloning ${url}"
-              if git clone -b "${BRANCH}" --depth=1 "${url}" susfs4ksu; then
+              echo "SUSFS clone attempt ${attempt}: ${BRANCH}"
+
+              if git clone \
+                --depth=1 \
+                --single-branch \
+                --branch "${BRANCH}" \
+                "${PRIMARY}" \
+                susfs4ksu; then
                 return 0
               fi
-              echo "Clone failed (attempt ${attempt}), retrying in $((attempt*5))s..."
+
               rm -rf susfs4ksu
-              sleep $((attempt*5))
+              sleep $((attempt * 8))
             done
+
             return 1
           }
 
-          if ! clone_with_retry "${PRIMARY}"; then
-            echo "::warning::Primary GitLab clone failed after retries (likely 409 rate-limit), trying mirror..."
-            if ! clone_with_retry "${MIRROR}"; then
-              echo "::error::Both primary and mirror clones of susfs4ksu failed"
-              exit 1
-            fi
-          fi
-
-          cd susfs4ksu
-          if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
-            git fetch --depth=1 origin "${{ github.event.inputs.susfs_commit }}" || true
-            git checkout "${{ github.event.inputs.susfs_commit }}"
-          fi
-          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-
-      - name: Copy SUSFS kernel patches
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/common
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
-
-      - name: Apply android12-5.10 pre-patch compatibility fixes
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ "${SUBLEVEL}" -le "43" ]; then
-            perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*\1\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
-          fi
-          if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '/^[[:space:]]*\/\*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
-          fi
-
-      - name: Apply SUSFS kernel patch
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
-            echo "::error::SUSFS patch failed to apply cleanly"
+          if ! clone_susfs; then
+            echo "::error::SUSFS clone failed after retries"
             exit 1
           fi
 
-      - name: Fix SUSFS set_nameidata argument mismatch
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
+          cd susfs4ksu
 
-      - name: Revert android12-5.10 pre-patch compatibility fixes
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ "${SUBLEVEL}" -le "43" ]; then
-            sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
-          fi
-          if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's/^(\s+if \(inode\) \{)/$1\n\t\t\/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
+          COMMIT="${{ github.event.inputs.susfs_commit }}"
+
+          if [ -n "${COMMIT}" ]; then
+            git fetch --depth=1 origin "${COMMIT}"
+            git checkout --detach "${COMMIT}"
           fi
 
-      - name: Apply SUSFS show_pad fix (older sublevels only)
-        working-directory: kernel_workspace/common
+          echo "Selected SUSFS commit: $(git rev-parse HEAD)"
+          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Verify SUSFS layout
+        working-directory: kernel_workspace
+        shell: bash
         run: |
           set -euo pipefail
-          if [ "${SUBLEVEL}" -le "209" ]; then
-            sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
+
+          test -d susfs4ksu/kernel_patches
+          test -f susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
+
+          test -d susfs4ksu/kernel_patches/fs
+          test -d susfs4ksu/kernel_patches/include/linux
+
+          echo "SUSFS layout verified"
+
+      - name: Copy SUSFS files
+        working-directory: kernel_workspace/common
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp -av ../susfs4ksu/kernel_patches/fs/. fs/
+          cp -av ../susfs4ksu/kernel_patches/include/linux/. include/linux/
+          cp -av \
+            ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch \
+            ./50_add_susfs_in_gki-android12-5.10.patch
+
+      - name: Apply SUSFS patch strictly
+        working-directory: kernel_workspace/common
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if patch \
+            --batch \
+            --forward \
+            --fuzz=0 \
+            -p1 \
+            < 50_add_susfs_in_gki-android12-5.10.patch; then
+            echo "SUSFS patch applied cleanly"
+          else
+            echo "::error::SUSFS patch did not apply cleanly"
+            find . -name "*.rej" -o -name "*.orig"
+            exit 1
           fi
 
-      - name: Setup KernelSU-Next (Wild KSU, dev-susfs)
+      - name: Resolve SUSFS statfs helper
         working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
 
-      - name: Bypass KernelSU Kbuild Check
-        working-directory: kernel_workspace/common/drivers/kernelsu
+          SYMBOL="susfs_sus_kstat_spoof_vfs_statfs"
+          SOURCE="fs/statfs.c"
+
+          if ! grep -Rqs \
+            --include='*.c' \
+            --include='*.h' \
+            "${SYMBOL}" \
+            fs include security drivers; then
+            echo "::error::${SYMBOL} is absent from SUSFS source"
+            exit 1
+          fi
+
+          DECL_FILE="$(
+            grep -RIl \
+              --include='*.h' \
+              "${SYMBOL}" \
+              include fs security drivers 2>/dev/null | head -n1 || true
+          )"
+
+          if [ -z "${DECL_FILE}" ]; then
+            echo "::error::No SUSFS header declaration found for ${SYMBOL}"
+            grep -Rns "${SYMBOL}" fs include security drivers || true
+            exit 1
+          fi
+
+          HEADER="${DECL_FILE#./}"
+          HEADER="${HEADER#include/}"
+
+          if ! grep -qF "#include <${HEADER}>" "${SOURCE}"; then
+            sed -i "1i#include <${HEADER}>" "${SOURCE}"
+          fi
+
+          echo "SUSFS statfs declaration: ${DECL_FILE}"
+          head -n 12 "${SOURCE}"
+
+      - name: Fix compatible SUSFS nameidata call
+        working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/# Bypass Kbuild check/g' Kbuild || true
 
-      - name: Fix KernelSU-Next (static.patch)
-        working-directory: kernel_workspace/common/KernelSU-Next
+          if grep -q \
+            'set_nameidata(nd, old_dfd, fake_filename, NULL);' \
+            fs/namei.c; then
+            sed -i \
+              's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' \
+              fs/namei.c
+          fi
+
+      - name: Setup KernelSU-Next latest
+        working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          curl -LSs -o static.patch \
-            https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
-          patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
 
-      - name: Install Baseband Guard (BBG)
+          if [ -n "${{ github.event.inputs.ksu_branch }}" ]; then
+            KSU_BRANCH="${{ github.event.inputs.ksu_branch }}"
+          else
+            KSU_BRANCH="dev-susfs"
+          fi
+
+          curl -fL --retry 5 --retry-all-errors \
+            "${KSU_SETUP_URL}" \
+            -o /tmp/ksu-setup.sh
+
+          chmod +x /tmp/ksu-setup.sh
+          bash /tmp/ksu-setup.sh "${KSU_BRANCH}"
+
+      - name: Verify KernelSU source
+        working-directory: kernel_workspace/common
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d drivers/kernelsu
+
+          grep -Rqs "config KSU" drivers/kernelsu || {
+            echo "::error::KernelSU Kconfig was not installed"
+            exit 1
+          }
+
+          echo "KernelSU source verified"
+
+      - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
+        shell: bash
         run: |
           set -euo pipefail
-          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
-          if [ -d "common/security/baseband_guard" ]; then
-            sed -i 's/ -Werror//g' common/security/baseband_guard/Makefile || true
-          fi
 
-      - name: Configure Baseband Guard LSM
+          curl -fL --retry 5 --retry-all-errors \
+            https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh \
+            -o /tmp/baseband-guard-setup.sh
+
+          chmod +x /tmp/baseband-guard-setup.sh
+          bash /tmp/baseband-guard-setup.sh
+
+          test -d common/security/baseband-guard
+
+      - name: Integrate Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          if grep -q "baseband_guard" common/security/Kconfig; then
-            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig || true
-          fi
-
-      - name: Apply BBRv3 backport
         working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
-          BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
-          BBR_CONG_NAME="bbr"
-          BBRV3_PATCH_APPLIED="false"
-          if [ -f "$BBRV3_PATCH" ]; then
-            if patch -p1 < "$BBRV3_PATCH"; then
-              BBRV3_PATCH_APPLIED="true"
-              DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
-              if [ -n "$DETECTED" ]; then
-                BBR_CONG_NAME="$DETECTED"
-              fi
-            fi
-          fi
-          echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
-          echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
-          if ! grep -qF 'int proc_dou8vec_minmax(' ./include/linux/sysctl.h; then
-            for p in sysctl_add_proc_dou8vec_minmax.patch sysctl_fix_data-races_in_proc_dou8vec_minmax.patch; do
-              PF="/tmp/wildpatches/common/bbrv3/$p"
-              [ -f "$PF" ] && { patch -p1 < "$PF" || echo "::warning::$p did not apply cleanly"; }
-            done
-          fi
+          test -f security/Kconfig
+          test -d security/baseband-guard
 
-      - name: Apply NTSync patches
+          python3 - security/Kconfig <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          if "baseband_guard" not in text:
+              raise SystemExit(
+                  "Baseband Guard Kconfig entry is absent from security/Kconfig"
+              )
+
+          print("Baseband Guard Kconfig entry found")
+          PY
+
+      - name: Apply BBRv3 only when patch exists
         working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          if [ "${SUBLEVEL}" -le "208" ]; then
-            curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
-              https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply"
+
+          git clone \
+            --depth=1 \
+            https://github.com/WildKernels/kernel_patches.git \
+            /tmp/wildpatches
+
+          BBR_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
+
+          if [ ! -f "${BBR_PATCH}" ]; then
+            echo "::warning::BBRv3 patch not found; keeping normal BBR"
+            echo "BBRV3_PATCH_APPLIED=false" >> "${GITHUB_ENV}"
+            echo "BBR_CONG_NAME=bbr" >> "${GITHUB_ENV}"
+            exit 0
           fi
 
-          curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
-            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects"
+          if patch --batch --forward --fuzz=0 -p1 < "${BBR_PATCH}"; then
+            echo "BBRv3 applied"
+            echo "BBRV3_PATCH_APPLIED=true" >> "${GITHUB_ENV}"
+          else
+            echo "::warning::BBRv3 did not match this GKI source; using normal BBR"
+            find . -name "*.rej" -delete
+            echo "BBRV3_PATCH_APPLIED=false" >> "${GITHUB_ENV}"
+          fi
 
-          curl -LSs -o /tmp/ntsync_base.patch \
-            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects"
+          echo "BBR_CONG_NAME=bbr" >> "${GITHUB_ENV}"
 
-      - name: Apply Droidspaces kABI-safe patches (SYSVIPC + POSIX_MQUEUE)
+      - name: Inject deduplicated kernel configuration
         working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          DROIDSPACES_KABI_OK="true"
 
-          curl -LSs -o /tmp/droidspaces_sysvipc_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-          if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          TMP="$(mktemp)"
+
+          cat > "${TMP}" <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_TCP_CONG_ADVANCED=y
+          CONFIG_TCP_CONG_BBR=y
+          CONFIG_TCP_CONG_CUBIC=y
+          CONFIG_TCP_CONG_BIC=y
+          CONFIG_TCP_CONG_WESTWOOD=y
+          CONFIG_TCP_CONG_HTCP=y
+          CONFIG_NET_SCH_FQ=y
+          CONFIG_NET_SCH_FQ_CODEL=y
+          CONFIG_NET_SCH_CAKE=y
+          CONFIG_NAMESPACES=y
+          CONFIG_NET_NS=y
+          CONFIG_CGROUPS=y
+          CONFIG_PID_NS=y
+          CONFIG_USER_NS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_IPC_NS=y
+          CONFIG_NTSYNC=y
+          EOF
+
+          if [ "${{ github.event.inputs.enable_bbg }}" = "true" ]; then
+            echo "CONFIG_BBG=y" >> "${TMP}"
           fi
 
-          curl -LSs -o /tmp/droidspaces_posix_mqueue_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
-          if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
-          fi
+          python3 - "${DEFCONFIG}" "${TMP}" <<'PY'
+          from pathlib import Path
+          import sys
 
-          echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
+          defconfig = Path(sys.argv[1])
+          requested = Path(sys.argv[2]).read_text().splitlines()
+          entries = {}
 
-      - name: Inject configs to gki_defconfig
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/common/arch/arm64/configs
+          for line in defconfig.read_text().splitlines():
+              if line.startswith("CONFIG_") and "=" in line:
+                  key = line.split("=", 1)[0]
+                  entries[key] = line
 
-          echo "CONFIG_KSU=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> gki_defconfig
+          for line in requested:
+              if line.startswith("CONFIG_") and "=" in line:
+                  key = line.split("=", 1)[0]
+                  entries[key] = line
 
-          if [ "${{ github.event.inputs.enable_bbg }}" = "true" ] && [ -d "../../../security/baseband_guard" ]; then
-            echo "CONFIG_BBG=y" >> gki_defconfig
-          fi
+          defconfig.write_text("\n".join(entries.values()) + "\n")
+          PY
 
-          echo "CONFIG_TCP_CONG_ADVANCED=y" >> gki_defconfig
-          echo "CONFIG_TCP_CONG_BBR=y" >> gki_defconfig
-          echo "CONFIG_TCP_CONG_CUBIC=y" >> gki_defconfig
-          echo "CONFIG_TCP_CONG_BIC=y" >> gki_defconfig
-          echo "CONFIG_TCP_CONG_WESTWOOD=y" >> gki_defconfig
-          echo "CONFIG_TCP_CONG_HTCP=y" >> gki_defconfig
-          if [ "${BBRV3_PATCH_APPLIED}" = "true" ]; then
-            echo "CONFIG_TCP_CONG_BBR3=y" >> gki_defconfig
-          fi
-          echo "CONFIG_DEFAULT_TCP_CONG=\"${BBR_CONG_NAME}\"" >> gki_defconfig
-          echo "CONFIG_NET_SCH_FQ=y" >> gki_defconfig
-          echo "CONFIG_NET_SCH_FQ_CODEL=y" >> gki_defconfig
-          echo "CONFIG_NET_SCH_CAKE=y" >> gki_defconfig
+          rm -f "${TMP}"
 
-          echo "CONFIG_NTSYNC=y" >> gki_defconfig
-
-          if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
-            echo "CONFIG_SYSVIPC=y" >> gki_defconfig
-            echo "CONFIG_POSIX_MQUEUE=y" >> gki_defconfig
-            echo "CONFIG_IPC_NS=y" >> gki_defconfig
-          fi
-          echo "CONFIG_NAMESPACES=y" >> gki_defconfig
-          echo "CONFIG_NET_NS=y" >> gki_defconfig
-          echo "CONFIG_CGROUPS=y" >> gki_defconfig
-          echo "CONFIG_PID_NS=y" >> gki_defconfig
-          echo "CONFIG_USER_NS=y" >> gki_defconfig
-          echo "CONFIG_DEVTMPFS=y" >> gki_defconfig
-          echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> gki_defconfig
-          echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y" >> gki_defconfig
-          echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> gki_defconfig
-          echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> gki_defconfig
-          echo "CONFIG_IP_SET=y" >> gki_defconfig
-          echo "CONFIG_IP_SET_HASH_IP=y" >> gki_defconfig
-          echo "CONFIG_IP_SET_HASH_NET=y" >> gki_defconfig
-          echo "CONFIG_NETFILTER_XT_SET=y" >> gki_defconfig
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> gki_defconfig
-          echo "CONFIG_TMPFS_XATTR=y" >> gki_defconfig
-
-      - name: Apply custom kernel branding
+      - name: Validate source before build
         working-directory: kernel_workspace/common
+        shell: bash
         run: |
           set -euo pipefail
-          mv scripts/setlocalversion scripts/setlocalversion.orig
-          chmod +x scripts/setlocalversion.orig
-          cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
-          #!/bin/sh
-          printf -- '-BLAZE-KSUNv1-STABLE\n'
-          SETLOCALVERSION_EOF
-          chmod +x scripts/setlocalversion
 
-      - name: Disable strict defconfig verification
-        working-directory: kernel_workspace
-        run: sed -i 's/check_defconfig//' ./common/build.config.gki
+          grep -Rqs \
+            "susfs_sus_kstat_spoof_vfs_statfs" \
+            fs include security drivers
+
+          grep -q '^CONFIG_KSU_SUSFS_SUS_KSTAT=y$' \
+            arch/arm64/configs/gki_defconfig
+
+          if [ "${{ github.event.inputs.enable_bbg }}" = "true" ]; then
+            test -d security/baseband-guard
+            grep -q '^CONFIG_BBG=y$' \
+              arch/arm64/configs/gki_defconfig
+          fi
+
+          echo "Source validation passed"
 
       - name: Build kernel
         working-directory: kernel_workspace
+        shell: bash
         run: |
-          set -euo pipefail
-          export KBUILD_BUILD_USER="builder"
-          export KBUILD_BUILD_HOST="ci"
+          set -o pipefail
 
+          export KBUILD_BUILD_USER="builder"
+          export KBUILD_BUILD_HOST="github-actions"
           export LLVM=1
           export LLVM_IAS=1
 
           LTO=thin \
           BUILD_CONFIG=common/build.config.gki.aarch64 \
           USE_CCACHE=1 \
-          CCACHE_DIR="${{ env.CCACHE_DIR }}" \
-          build/build.sh -j"$(nproc)"
+          CCACHE_DIR="${CCACHE_DIR}" \
+          build/build.sh -j"$(nproc)" 2>&1 | tee /tmp/kernel-build.log
 
-      - name: Verify namespace / cgroup configs made it into the final .config
+          status="${PIPESTATUS[0]}"
+
+          if [ "${status}" -ne 0 ]; then
+            echo "::error::Kernel build failed"
+            grep -B10 -A30 \
+              -E "error:|Error [0-9]+|statfs|baseband" \
+              /tmp/kernel-build.log || true
+            exit "${status}"
+          fi
+
+      - name: Verify final configuration
         working-directory: kernel_workspace
+        shell: bash
         run: |
           set -euo pipefail
-          CFG=$(find out -name ".config" | head -n1)
-          if [ -z "$CFG" ]; then
-            echo "::error::Could not find a compiled .config under kernel_workspace/out"
+
+          CFG="$(find out -type f -name .config | head -n1)"
+
+          if [ -z "${CFG}" ]; then
+            echo "::error::Final .config not found"
             exit 1
           fi
-          FAILED="false"
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS; do
-            if grep -q "^${SYM}=y$" "$CFG"; then
-              echo "✓ ${SYM}=y confirmed in final .config"
-            else
-              echo "::error::${SYM} is NOT enabled in the final .config"
-              FAILED="true"
-            fi
+
+          for symbol in \
+            CONFIG_KSU \
+            CONFIG_KSU_SUSFS \
+            CONFIG_KSU_SUSFS_SUS_KSTAT \
+            CONFIG_NAMESPACES \
+            CONFIG_NET_NS \
+            CONFIG_CGROUPS \
+            CONFIG_PID_NS \
+            CONFIG_USER_NS; do
+
+            grep -q "^${symbol}=y$" "${CFG}" || {
+              echo "::error::${symbol} is not enabled"
+              exit 1
+            }
           done
-          if [ "${FAILED}" = "true" ]; then
+
+          if [ "${{ github.event.inputs.enable_bbg }}" = "true" ]; then
+            grep -q '^CONFIG_BBG=y$' "${CFG}" || {
+              echo "::error::CONFIG_BBG is not enabled"
+              exit 1
+            }
+
+            grep '^CONFIG_LSM=' "${CFG}" || {
+              echo "::error::CONFIG_LSM is missing"
+              exit 1
+            }
+          fi
+
+      - name: Locate Image
+        working-directory: kernel_workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="$(
+            find out -type f \
+              \( -path '*/dist/Image' -o -name Image \) \
+              | head -n1
+          )"
+
+          if [ -z "${IMAGE}" ]; then
+            echo "::error::Kernel Image not found"
+            find out -maxdepth 5 -type f | head -n100
             exit 1
           fi
 
-      - name: Locate built Image
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          IMG=$(find out -path "*dist/Image" | head -n1)
-          if [ -z "$IMG" ]; then
-            IMG=$(find out -name "Image" | head -n1)
-          fi
-          if [ -z "$IMG" ]; then
-            echo "::error::No kernel Image found"
-            exit 1
-          fi
-          echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
+          cp "${IMAGE}" "${GITHUB_WORKSPACE}/Image"
 
       - name: Package AnyKernel3
+        shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
-          cp "${{ env.IMG_PATH }}" ak3/Image
+
+          git clone \
+            --depth=1 \
+            --branch gki-2.0 \
+            https://github.com/WildKernels/AnyKernel3.git \
+            ak3
+
+          cp Image ak3/Image
+
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs.zip" . -x ".git*"
+          zip -r9 -q \
+            "${GITHUB_WORKSPACE}/${{ github.event.inputs.device_name }}-android12-5.10-susfs.zip" \
+            . \
+            -x '.git/*' \
+            -x '.gitignore'
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.device_name }}-build
-          path: "*.zip"
+          path: |
+            *.zip
+            Image
+          if-no-files-found: error
           retention-days: 14
