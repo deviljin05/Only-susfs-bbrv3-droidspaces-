@@ -43,13 +43,7 @@ jobs:
           sudo apt-get install -y git curl bc bison flex libssl-dev \
             build-essential python3 python3-pip libncurses-dev \
             ccache zip unzip device-tree-compiler patch \
-            binutils binutils-aarch64-linux-gnu lld
-          echo "=== Checking available linkers ==="
-          ls -la /usr/bin/ld* || true
-          which ld.gold || echo "ld.gold NOT found"
-          which ld.bfd || echo "ld.bfd NOT found"
-          which ld.lld || echo "ld.lld NOT found"
-          which ld || echo "ld NOT found"
+            binutils binutils-aarch64-linux-gnu lld libgcc-s1 libgcc-11-dev
 
       - name: Install repo tool
         run: |
@@ -77,6 +71,17 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
+      - name: Locate libgcc_s.so.1 for host tool linking
+        run: |
+          LIBGCC_PATH="$(dirname "$(find /usr/lib /lib -name 'libgcc_s.so.1' 2>/dev/null | head -n1)")"
+          if [ -z "$LIBGCC_PATH" ]; then
+            echo "::error::libgcc_s.so.1 not found on the system"
+            exit 1
+          fi
+          echo "Found libgcc_s.so.1 in: ${LIBGCC_PATH}"
+          ls -la "${LIBGCC_PATH}/libgcc_s.so.1"
+          echo "LIBGCC_PATH=${LIBGCC_PATH}" >> "$GITHUB_ENV"
+
       - name: Symlink ld/lld into Android prebuilt clang path
         working-directory: kernel_workspace
         run: |
@@ -96,29 +101,19 @@ jobs:
             exit 1
           fi
           echo "Clang bin directory: ${CLANG_BIN}"
-          echo "=== Original ld-related binaries in clang dir ==="
-          ls -la "${CLANG_BIN}" | grep -E 'ld|lld' || true
-
-          # CRITICAL FIX: Override ld.lld with ld.bfd to avoid nVHE errors
-          # The Android build system ignores LD env var and uses $CLANG_BIN/ld.lld directly.
-          # So we symlink ld.bfd INTO ld.lld's place.
+          # Override ld.lld with ld.bfd to avoid nVHE errors
           if [ -x /usr/bin/ld.bfd ]; then
             ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld.lld"
-            echo "✓ Overrode ${CLANG_BIN}/ld.lld -> /usr/bin/ld.bfd"
-          fi
-          if [ -x /usr/bin/ld.bfd ]; then
             ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld"
-            echo "✓ Overrode ${CLANG_BIN}/ld -> /usr/bin/ld.bfd"
+            echo "✓ Overrode ld.lld and ld with /usr/bin/ld.bfd"
+          else
+            echo "::error::/usr/bin/ld.bfd not found. Install 'binutils'."
+            exit 1
           fi
-          # Also handle if there's a separate real-ld or similar
-          if [ -x /usr/bin/ld.bfd ]; then
-            ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld.bfd"
-            echo "✓ Set ${CLANG_BIN}/ld.bfd -> /usr/bin/ld.bfd"
-          fi
-
-          echo "=== After override ==="
-          ls -la "${CLANG_BIN}" | grep -E 'ld|lld' || true
-          "${CLANG_BIN}/clang-12" --version || true
+          # Also make sure system libgcc_s is discoverable by putting a copy in a standard location
+          mkdir -p /tmp/host-libs
+          cp -L "${LIBGCC_PATH}/libgcc_s.so.1" /tmp/host-libs/ 2>/dev/null || true
+          ls -la /tmp/host-libs/
 
       - name: Clone SUSFS4KSU (latest = current SUSFS release)
         working-directory: kernel_workspace
@@ -183,12 +178,10 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          # Step 1: Inject missing constants into susfs.h (idempotent)
           if ! grep -q 'SUSFS_MAX_LEN_PATHNAME' include/linux/susfs.h; then
             sed -i '1i #define SUSFS_MAX_LEN_PATHNAME 256\n#define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 8192\n#define SUSFS_ENABLED_FEATURES_SIZE 8192' include/linux/susfs.h
             echo "Injected SUSFS constants into susfs.h"
           fi
-          # Step 2: Directly add include to fs/statfs.c (guaranteed)
           if [ -f fs/statfs.c ]; then
             if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
               sed -i "1i #include <linux/susfs.h>" fs/statfs.c
@@ -197,7 +190,6 @@ jobs:
             echo "=== First 5 lines of fs/statfs.c ==="
             head -5 fs/statfs.c
           fi
-          # Step 3: Scan all files for susfs_ usage and add include
           FILES_TO_FIX="$(grep -rlE '\bsusfs_[a-zA-Z0-9_]+\b' --include='*.c' --include='*.h' . | sort -u || true)"
           for f in $FILES_TO_FIX; do
             case "$f" in
@@ -401,11 +393,23 @@ jobs:
             sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
           fi
 
-          # Force clang to use ld.bfd (ld.lld is already overridden by symlink, but just in case)
+          # Force clang to use ld.bfd (ld.lld is already overridden by symlink)
           export LD=/usr/bin/ld.bfd
-          export LDFLAGS="-fuse-ld=bfd --no-warn-mismatch"
+          # Pass rpath-link so BFD can find host libraries (libgcc_s, libc++, etc.)
+          export HOSTLDFLAGS="-Wl,-rpath-link=${LIBGCC_PATH} -Wl,-rpath-link=/usr/lib/x86_64-linux-gnu -Wl,-rpath-link=/lib/x86_64-linux-gnu -Wl,--allow-shlib-undefined"
+          export LDFLAGS="-Wl,-rpath-link=${LIBGCC_PATH} -Wl,-rpath-link=/usr/lib/x86_64-linux-gnu -Wl,-rpath-link=/lib/x86_64-linux-gnu -Wl,--allow-shlib-undefined"
+          export KBUILD_HOSTLDFLAGS="${HOSTLDFLAGS}"
+          export KBUILD_LDFLAGS="${LDFLAGS}"
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
+
+          echo "=== Environment for build ==="
+          echo "LIBGCC_PATH=${LIBGCC_PATH}"
+          echo "LD=${LD}"
+          echo "HOSTLDFLAGS=${HOSTLDFLAGS}"
+          echo "LDFLAGS=${LDFLAGS}"
+          ls -la "${LIBGCC_PATH}/libgcc_s.so.1" || true
+
           LTO=thin \
           BUILD_CONFIG=common/build.config.gki.aarch64 \
           USE_CCACHE=1 \
@@ -453,5 +457,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.device_name }}-build
-          path: "*.zip"
+          paths: "*.zip"
           retention-days: 14
