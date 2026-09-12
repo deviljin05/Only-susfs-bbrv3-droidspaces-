@@ -345,54 +345,6 @@ jobs:
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
-      # ═══════════════════════════════════════════════════════════════
-      # NEW: Custom Kernel Configs (CAN + IIO/PCI + HID + RTL8XXXU + WiFi)
-      # ═══════════════════════════════════════════════════════════════
-      - name: Set custom kernel configs (CAN + IIO/PCI + HID + RTL8XXXU + WiFi)
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            # CAN Bus
-            echo "CONFIG_CAN=y"
-            echo "CONFIG_CAN_RAW=y"
-            echo "CONFIG_CAN_BCM=y"
-            echo "CONFIG_CAN_GW=y"
-
-            # IIO / PCI Endpoint ConfigFS
-            echo "CONFIG_IIO_CONFIGFS=y"
-            echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
-
-            # USB Gadget / ConfigFS
-            echo "CONFIG_USB_GADGET=y"
-            echo "CONFIG_USB_CONFIGFS=y"
-            echo "CONFIG_USB_CONFIGFS_F_HID=y"
-            echo "CONFIG_USB_CONFIGFS_ECM_SUBSET=y"
-            echo "CONFIG_USB_CONFIGFS_F_LB_SS=y"
-            echo "CONFIG_USB_CONFIGFS_F_PRINTER=y"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1=y"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=y"
-            echo "CONFIG_USB_CONFIGFS_OBEX=y"
-
-            # USB HID Gadget
-            echo "CONFIG_USB_F_HID=y"
-            echo "CONFIG_USB_HID=y"
-            echo "CONFIG_HID_GADGET=y"
-
-            # RTL8188CUS / rtl8xxxu
-            echo "CONFIG_RTL8XXXU=y"
-            echo "CONFIG_RTL8XXXU_UNTESTED=y"
-
-            # Wi-Fi / Wireless stack
-            echo "CONFIG_WLAN=y"
-            echo "CONFIG_CFG80211=y"
-            echo "CONFIG_MAC80211=y"
-            echo "CONFIG_WEXT_CORE=y"
-            echo "CONFIG_WEXT_PROC=y"
-            echo "CONFIG_WEXT_SPY=y"
-            echo "CONFIG_WEXT_PRIV=y"
-          } >> gki_defconfig
-          echo "✓ Custom configs added"
-
       - name: Apply NTSync patches
         working-directory: kernel_workspace/common
         run: |
@@ -465,7 +417,7 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_KPROBES CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_RTL8XXXU CONFIG_CAN CONFIG_USB_CONFIGFS_F_HID; do
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_KPROBES CONFIG_KSU CONFIG_KSU_SUSFS; do
             if grep -q "^${SYM}=y$" "$CFG"; then
               echo "OK: ${SYM}=y"
             else
