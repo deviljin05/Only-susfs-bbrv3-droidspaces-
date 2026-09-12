@@ -93,6 +93,9 @@ jobs:
           if [ -x /usr/bin/ld.lld ]; then
             ln -sf /usr/bin/ld.lld "${CLANG_BIN}/ld.lld"
           fi
+          if [ -x /usr/bin/ld.bfd ]; then
+            ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld"
+          fi
           if [ -x /usr/bin/ld ]; then
             ln -sf /usr/bin/ld "${CLANG_BIN}/ld"
           fi
