@@ -12,7 +12,7 @@ on:
         required: false
         default: ""
       ksu_ref:
-        description: "RapliVx/KernelSU ref (branch/tag/commit). Default 'xxksu'"
+        description: "RapliVx/KernelSU ref (branch/tag/commit). Default 'xxksu' always tracks the latest MamboSU dev commit on that branch"
         required: false
         default: "xxksu"
       device_name:
@@ -23,6 +23,15 @@ on:
         description: "Enable Baseband Guard (BBG)"
         required: true
         default: "true"
+      manager_variant:
+        description: "Manager APK to bundle alongside the flashable zip (best-effort, never fails the build)"
+        required: true
+        default: "mambosu"
+        type: choice
+        options:
+          - mambosu
+          - resukisu
+          - none
 
 env:
   VERSION: android12-5.10
@@ -117,7 +126,7 @@ jobs:
             exit 1
           fi
 
-      - name: Clone RapliVx/KernelSU
+      - name: Clone RapliVx/KernelSU (MamboSU)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -128,7 +137,18 @@ jobs:
             git checkout "${{ github.event.inputs.ksu_ref }}"
           fi
           echo "KSU_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "RapliVx/KernelSU commit: $(git rev-parse HEAD)"
+          echo "RapliVx/KernelSU (MamboSU) commit: $(git rev-parse HEAD)"
+
+      - name: Verify MamboSU source freshness
+        working-directory: kernel_workspace/KernelSU
+        run: |
+          set -euo pipefail
+          echo "Branch:  ${KSU_BRANCH}"
+          echo "Commit:  $(git rev-parse HEAD)"
+          echo "Date:    $(git log -1 --format=%cI)"
+          echo "Subject: $(git log -1 --format=%s)"
+          echo "This clone always pulls the tip of the branch above (shallow, depth=1),"
+          echo "so unless 'ksu_ref' input overrides it, you are always on the latest MamboSU dev commit."
 
       - name: Clone SUSFS4KSU
         working-directory: kernel_workspace
@@ -249,14 +269,6 @@ jobs:
           done
           echo "✓ SUSFS include fix complete"
 
-      - name: Fix SUSFS set_nameidata argument mismatch
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ -f fs/namei.c ]; then
-            sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
-          fi
-
       - name: Revert android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
         run: |
@@ -345,6 +357,50 @@ jobs:
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
+      - name: Set custom device/hardware configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "# --- CAN Bus ---"
+            echo "CONFIG_CAN=y"
+            echo "CONFIG_CAN_RAW=y"
+            echo "CONFIG_CAN_BCM=y"
+            echo "CONFIG_CAN_GW=y"
+            echo ""
+            echo "# --- IIO / PCI Endpoint ConfigFS ---"
+            echo "CONFIG_IIO_CONFIGFS=y"
+            echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
+            echo ""
+            echo "# --- USB Gadget / ConfigFS ---"
+            echo "CONFIG_USB_GADGET=y"
+            echo "CONFIG_USB_CONFIGFS=y"
+            echo "CONFIG_USB_CONFIGFS_F_HID=y"
+            echo "CONFIG_USB_CONFIGFS_ECM_SUBSET=y"
+            echo "CONFIG_USB_CONFIGFS_F_LB_SS=y"
+            echo "CONFIG_USB_CONFIGFS_F_PRINTER=y"
+            echo "CONFIG_USB_CONFIGFS_F_UAC1=y"
+            echo "CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=y"
+            echo "CONFIG_USB_CONFIGFS_OBEX=y"
+            echo ""
+            echo "# --- USB HID Gadget ---"
+            echo "CONFIG_USB_F_HID=y"
+            echo "CONFIG_USB_HID=y"
+            echo "CONFIG_HID_GADGET=y"
+            echo ""
+            echo "# --- RTL8188CUS / rtl8xxxu (external USB dongle driver) ---"
+            echo "CONFIG_RTL8XXXU=y"
+            echo "CONFIG_RTL8XXXU_UNTESTED=y"
+            echo ""
+            echo "# --- Wi-Fi / Wireless stack ---"
+            echo "CONFIG_WLAN=y"
+            echo "CONFIG_CFG80211=y"
+            echo "CONFIG_MAC80211=y"
+            echo "CONFIG_WEXT_CORE=y"
+            echo "CONFIG_WEXT_PROC=y"
+            echo "CONFIG_WEXT_SPY=y"
+            echo "CONFIG_WEXT_PRIV=y"
+          } >> gki_defconfig
+
       - name: Apply NTSync patches
         working-directory: kernel_workspace/common
         run: |
@@ -417,11 +473,20 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           [ -n "$CFG" ]
+          echo "--- Core KSU / namespace configs ---"
           for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_KPROBES CONFIG_KSU CONFIG_KSU_SUSFS; do
             if grep -q "^${SYM}=y$" "$CFG"; then
               echo "OK: ${SYM}=y"
             else
               echo "WARNING: ${SYM} not enabled"
+            fi
+          done
+          echo "--- Custom device/hardware configs (informational — kernel's own dependency resolution (olddefconfig) may silently drop some of these if a dependency is unmet, that is normal and not a build error) ---"
+          for SYM in CONFIG_CAN CONFIG_IIO_CONFIGFS CONFIG_PCI_ENDPOINT_CONFIGFS CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_RTL8XXXU CONFIG_WLAN CONFIG_CFG80211 CONFIG_MAC80211; do
+            if grep -q "^${SYM}=y$" "$CFG"; then
+              echo "OK: ${SYM}=y"
+            else
+              echo "INFO: ${SYM} not present in final .config (dropped by dependency resolution or not applicable to this arch/branch)"
             fi
           done
 
@@ -448,9 +513,45 @@ jobs:
           cd ak3
           zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-mambosu-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
 
+      - name: Download Manager APK (best-effort, never fails the build)
+        if: ${{ github.event.inputs.manager_variant != 'none' }}
+        run: |
+          set +e
+          case "${{ github.event.inputs.manager_variant }}" in
+            mambosu)
+              MGR_REPO="RapliVx/KernelSU"
+              ;;
+            resukisu)
+              # ReSukiSU's own manager is not published as a GitHub Release (nightly/CI only),
+              # but its driver is documented as multi-manager compatible with the official
+              # KernelSU manager, so that is used here as the reliable, automatable fallback.
+              MGR_REPO="tiann/KernelSU"
+              ;;
+            *)
+              MGR_REPO=""
+              ;;
+          esac
+          if [ -n "$MGR_REPO" ]; then
+            echo "Looking up latest manager release from ${MGR_REPO}..."
+            ASSET_URL=$(curl -s "https://api.github.com/repos/${MGR_REPO}/releases/latest" \
+              | grep -oE '"browser_download_url": *"[^"]*\.apk"' \
+              | head -n1 \
+              | sed -E 's/"browser_download_url": *"([^"]*)"/\1/')
+            if [ -n "$ASSET_URL" ]; then
+              echo "Found manager APK: $ASSET_URL"
+              curl -LSs -o "manager-${{ github.event.inputs.manager_variant }}.apk" "$ASSET_URL" \
+                && echo "✓ Manager APK downloaded"
+            else
+              echo "::warning::No .apk release asset found for ${MGR_REPO}; skipping manager bundling. Build continues normally."
+            fi
+          fi
+          exit 0
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.device_name }}-build
-          path: "*.zip"
+          path: |
+            *.zip
+            *.apk
           retention-days: 14
