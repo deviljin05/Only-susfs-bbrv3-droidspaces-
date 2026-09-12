@@ -1,18 +1,14 @@
-name: Build Custom GKI Kernel (MamboSU / ReSukiSU + SUSFS + BBRv3)
+name: Build Custom GKI Kernel (ReSukiSU + SUSFS + BBRv3)
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "Kernel branch tag — 'lts' tracks the rolling LTS branch"
+        description: "Kernel branch tag — 'lts' tracks the rolling LTS branch (recommended, always current)"
         required: true
         default: "lts"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
-        required: false
-        default: ""
-      ksu_ref:
-        description: "Optional ref (branch/tag/commit) override on top of the chosen ksu_variant's default branch. Leave empty to always track the latest commit on that variant's default branch"
+        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch, i.e. latest SUSFS release)"
         required: false
         default: ""
       device_name:
@@ -20,29 +16,13 @@ on:
         required: false
         default: "gki-custom"
       enable_bbg:
-        description: "Enable Baseband Guard (BBG)"
+        description: "Enable Baseband Guard (BBG) — LSM that blocks unauthorized writes to modem/bootloader partitions, protects against brick from malicious root modules"
         required: true
         default: "true"
-      ksu_variant:
-        description: "Root implementation to build — drives BOTH the kernel driver source AND the bundled manager APK. mambosu = RapliVx/KernelSU (xxksu, latest dev). resukisu = ReSukiSU/ReSukiSU (main, latest)"
-        required: true
-        default: "mambosu"
-        type: choice
-        options:
-          - mambosu
-          - resukisu
-      enable_usb_gadget_configs:
-        description: "Enable USB Gadget/ConfigFS function drivers (advanced — can conflict with the device's own vendor USB gadget driver; leave off unless you know your device needs it)"
-        required: true
-        default: "false"
 
 env:
   VERSION: android12-5.10
   CCACHE_DIR: /home/runner/.ccache
-  SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
-  SUSFS_BRANCH: "gki-android12-5.10"
-  # KSU_REPO / KSU_BRANCH are resolved dynamically per ksu_variant in the
-  # "Resolve KSU variant" step below, not hardcoded here.
 
 jobs:
   build:
@@ -77,25 +57,6 @@ jobs:
       - name: Set up ccache
         run: mkdir -p "${{ env.CCACHE_DIR }}"
 
-      - name: Resolve KSU variant (driver source + branch)
-        run: |
-          set -euo pipefail
-          case "${{ github.event.inputs.ksu_variant }}" in
-            mambosu)
-              echo "KSU_REPO=https://github.com/RapliVx/KernelSU.git" >> "$GITHUB_ENV"
-              echo "KSU_BRANCH=xxksu" >> "$GITHUB_ENV"
-              ;;
-            resukisu)
-              echo "KSU_REPO=https://github.com/ReSukiSU/ReSukiSU.git" >> "$GITHUB_ENV"
-              echo "KSU_BRANCH=main" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "::error::Unknown ksu_variant '${{ github.event.inputs.ksu_variant }}'"
-              exit 1
-              ;;
-          esac
-          echo "Selected ksu_variant: ${{ github.event.inputs.ksu_variant }}"
-
       - name: Sync GKI kernel source
         run: |
           mkdir kernel_workspace && cd kernel_workspace
@@ -120,100 +81,45 @@ jobs:
           echo "Found libgcc_s.so.1 in: ${LIBGCC_PATH}"
           echo "LIBGCC_PATH=${LIBGCC_PATH}" >> "$GITHUB_ENV"
 
-      - name: Override ld.lld with system ld.bfd (all toolchain copies)
+      - name: Symlink ld into Android prebuilt clang path
         working-directory: kernel_workspace
         run: |
-          set -uo pipefail
-          if [ ! -x /usr/bin/ld.bfd ]; then
+          set -euo pipefail
+          CLANG_BIN=""
+          for base in prebuilts-master/clang/host/linux-x86 prebuilts/clang/host/linux-x86; do
+            if [ -d "${base}" ]; then
+              FOUND="$(find "${base}" -maxdepth 3 -name 'clang-12' -type f 2>/dev/null | head -n1)"
+              if [ -n "${FOUND}" ]; then
+                CLANG_BIN="$(dirname "${FOUND}")"
+                break
+              fi
+            fi
+          done
+          if [ -z "${CLANG_BIN}" ]; then
+            echo "::error::Could not locate Android prebuilt clang-12 directory"
+            exit 1
+          fi
+          echo "Clang bin directory: ${CLANG_BIN}"
+          if [ -x /usr/bin/ld.bfd ]; then
+            ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld.lld"
+            ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld"
+            echo "✓ Overrode ld.lld and ld with /usr/bin/ld.bfd"
+          else
             echo "::error::/usr/bin/ld.bfd not found"
             exit 1
           fi
-          FOUND_ANY=0
-          # Find every ld.lld under any prebuilt clang toolchain directory — this does not
-          # depend on a specific version name (e.g. clang-12 vs clang-r416183b), which breaks
-          # every time Google bumps the toolchain on the rolling 'lts' branch. ld.lld itself
-          # may be a symlink, so match both regular files and symlinks.
-          for base in prebuilts-master prebuilts; do
-            if [ -d "${base}" ]; then
-              while IFS= read -r -d '' LD_LLD_PATH; do
-                DIR="$(dirname "${LD_LLD_PATH}")"
-                echo "Overriding ld.lld in: ${DIR}"
-                ln -sf /usr/bin/ld.bfd "${DIR}/ld.lld"
-                ln -sf /usr/bin/ld.bfd "${DIR}/ld"
-                FOUND_ANY=1
-              done < <(find "${base}" -maxdepth 6 \( -type f -o -type l \) -name 'ld.lld' -print0 2>/dev/null)
-            fi
-          done
-          if [ "${FOUND_ANY}" -eq 0 ]; then
-            echo "::error::Could not find any ld.lld under prebuilts-master/ or prebuilts/ to override"
-            exit 1
-          fi
-          echo "✓ ld.lld/ld overridden with /usr/bin/ld.bfd in every toolchain copy found"
 
-      - name: Clone KSU driver source (${{ github.event.inputs.ksu_variant }})
+      - name: Clone SUSFS4KSU (ShirkNeko fork — kept in sync with ReSukiSU)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          echo "Cloning ${KSU_REPO} @ ${KSU_BRANCH} (variant: ${{ github.event.inputs.ksu_variant }})"
-          git clone "${KSU_REPO}" -b "${KSU_BRANCH}" KernelSU --depth=1
-          cd KernelSU
-          if [ -n "${{ github.event.inputs.ksu_ref }}" ]; then
-            git fetch --depth=1 origin "${{ github.event.inputs.ksu_ref }}"
-            git checkout "${{ github.event.inputs.ksu_ref }}"
-          fi
-          echo "KSU_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "Driver commit: $(git rev-parse HEAD)"
-
-      - name: Verify KSU driver source freshness
-        working-directory: kernel_workspace/KernelSU
-        run: |
-          set -euo pipefail
-          echo "Variant: ${{ github.event.inputs.ksu_variant }}"
-          echo "Repo:    ${KSU_REPO}"
-          echo "Branch:  ${KSU_BRANCH}"
-          echo "Commit:  $(git rev-parse HEAD)"
-          echo "Date:    $(git log -1 --format=%cI)"
-          echo "Subject: $(git log -1 --format=%s)"
-          echo "This clone always pulls the tip of the branch above (shallow, depth=1),"
-          echo "so unless 'ksu_ref' input overrides it, you are always on the latest commit for this variant."
-
-      - name: Clone SUSFS4KSU
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          git clone --depth 1 -b "${SUSFS_BRANCH}" "${SUSFS_REPO}" susfs4ksu
+          git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
           cd susfs4ksu
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
-            git fetch --depth 1 origin "${{ github.event.inputs.susfs_commit }}"
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "SUSFS commit: $(git rev-parse HEAD)"
-
-      - name: Apply SUSFS patch to KSU driver
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-          cd KernelSU
-          if ! patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch; then
-            echo "::warning::10_enable_susfs_for_ksu.patch had rejects:"
-            find . -name "*.rej"
-          fi
-
-      - name: Setup KSU driver into kernel source
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ -f "../KernelSU/kernel/setup.sh" ]; then
-            echo "Running ${{ github.event.inputs.ksu_variant }} setup.sh..."
-            sh ../KernelSU/kernel/setup.sh
-          else
-            echo "setup.sh not found, doing manual integration..."
-            ln -sf "$(realpath --relative-to="drivers" "$(pwd)/../KernelSU/kernel")" "drivers/kernelsu"
-            grep -q "kernelsu" "drivers/Makefile" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "drivers/Makefile"
-            grep -q 'drivers/kernelsu/Kconfig' "drivers/Kconfig" || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' "drivers/Kconfig"
-          fi
+          echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
 
       - name: Set SUSFS kernel configs
         run: |
@@ -230,6 +136,9 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUD=y"
           } >> gki_defconfig
 
       - name: Copy SUSFS kernel patches
@@ -257,7 +166,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
-            echo "::error::SUSFS kernel patch failed — .rej files:"
+            echo "::error::SUSFS patch failed to apply cleanly — .rej files below:"
             find . -name "*.rej"
             exit 1
           fi
@@ -296,6 +205,12 @@ jobs:
           done
           echo "✓ SUSFS include fix complete"
 
+      - name: Fix SUSFS set_nameidata argument mismatch
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
+
       - name: Revert android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
         run: |
@@ -313,10 +228,16 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           if [ "${SUBLEVEL}" -le "209" ]; then
-            if [ -f fs/proc/task_mmu.c ]; then
-              sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
-            fi
+            sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
+
+      - name: Setup ReSukiSU (builtin branch — manual SUSFS integration)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s builtin
+          echo "Contents after ReSukiSU setup:"
+          ls -d KernelSU* 2>/dev/null || echo "::warning::no KernelSU* directory found — check setup.sh output above"
 
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -338,9 +259,9 @@ jobs:
         run: |
           set -euo pipefail
           if grep -q "baseband_guard" common/security/Kconfig; then
-            echo "✓ BBG registered"
+            echo "✓ BBG registered in common/security/Kconfig"
           else
-            echo "::error::baseband_guard not found"
+            echo "::error::baseband_guard not found in common/security/Kconfig after setup"
             exit 1
           fi
 
@@ -350,6 +271,7 @@ jobs:
         run: |
           BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
           echo "BBG_COMMIT=${BBG_COMMIT}" >> "$GITHUB_ENV"
+          echo "BBG commit: ${BBG_COMMIT}"
 
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -364,7 +286,19 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
           BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
           if [ -f "$BBRV3_PATCH" ]; then
-            patch -p1 < "$BBRV3_PATCH" || { echo "::warning::BBRv3 patch had rejects"; find . -name "*.rej"; }
+            patch -p1 < "$BBRV3_PATCH" || {
+              echo "::warning::BBRv3 patch had rejects — check .rej files below";
+              find . -name "*.rej";
+            }
+          else
+            echo "::warning::BBRv3 patch not found at expected path — skipping"
+          fi
+
+          if ! grep -qF 'int proc_dou8vec_minmax(' ./include/linux/sysctl.h; then
+            for p in sysctl_add_proc_dou8vec_minmax.patch sysctl_fix_data-races_in_proc_dou8vec_minmax.patch; do
+              PF="/tmp/wildpatches/common/bbrv3/$p"
+              [ -f "$PF" ] && { patch -p1 < "$PF" || echo "::warning::$p did not apply cleanly"; }
+            done
           fi
 
       - name: Set networking / TCP congestion configs
@@ -384,60 +318,6 @@ jobs:
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
-      - name: Set custom device/hardware configs (safe set)
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "# --- CAN Bus ---"
-            echo "CONFIG_CAN=y"
-            echo "CONFIG_CAN_RAW=y"
-            echo "CONFIG_CAN_BCM=y"
-            echo "CONFIG_CAN_GW=y"
-            echo ""
-            echo "# --- IIO / PCI Endpoint ConfigFS ---"
-            echo "CONFIG_IIO_CONFIGFS=y"
-            echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
-            echo ""
-            echo "# --- RTL8188CUS / rtl8xxxu (external USB dongle driver, does not touch the internal Wi-Fi chip) ---"
-            echo "CONFIG_RTL8XXXU=y"
-            echo "CONFIG_RTL8XXXU_UNTESTED=y"
-            echo ""
-            echo "# --- Wi-Fi / Wireless stack (near-universally already enabled on Android GKI) ---"
-            echo "CONFIG_WLAN=y"
-            echo "CONFIG_CFG80211=y"
-            echo "CONFIG_MAC80211=y"
-            echo "CONFIG_WEXT_CORE=y"
-            echo "CONFIG_WEXT_PROC=y"
-            echo "CONFIG_WEXT_SPY=y"
-            echo "CONFIG_WEXT_PRIV=y"
-          } >> gki_defconfig
-
-      - name: Set USB Gadget/ConfigFS configs (optional, advanced)
-        if: ${{ github.event.inputs.enable_usb_gadget_configs == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          echo "::warning::USB Gadget/ConfigFS configs enabled — this is the block most likely to conflict with a device's own vendor USB gadget driver and cause boot issues (KMI/symbol mismatch). Test on a spare device / keep a stock boot.img backup."
-          {
-            echo "# --- USB Gadget / ConfigFS ---"
-            echo "# Core framework kept as 'y' since Android normally needs it for ADB/charging anyway."
-            echo "CONFIG_USB_GADGET=y"
-            echo "CONFIG_USB_CONFIGFS=y"
-            echo "# Individual function drivers kept as modules ('m') instead of built-in ('y') so they"
-            echo "# don't force-load at boot and don't fight the vendor's own gadget composition."
-            echo "CONFIG_USB_CONFIGFS_F_HID=m"
-            echo "CONFIG_USB_CONFIGFS_ECM_SUBSET=m"
-            echo "CONFIG_USB_CONFIGFS_F_LB_SS=m"
-            echo "CONFIG_USB_CONFIGFS_F_PRINTER=m"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1=m"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=m"
-            echo "CONFIG_USB_CONFIGFS_OBEX=m"
-            echo ""
-            echo "# --- USB HID Gadget ---"
-            echo "CONFIG_USB_F_HID=m"
-            echo "CONFIG_USB_HID=y"
-            echo "CONFIG_HID_GADGET=m"
-          } >> gki_defconfig
-
       - name: Apply NTSync patches
         working-directory: kernel_workspace/common
         run: |
@@ -447,12 +327,15 @@ jobs:
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
             patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply"
           fi
+
           curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
           patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects"
+
           curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
           patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects"
+
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
       - name: Clean dirty flag
@@ -473,8 +356,7 @@ jobs:
           chmod +x scripts/setlocalversion.orig
           cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
           #!/bin/sh
-          out="$("$(dirname "$0")/setlocalversion.orig" "$@")"
-          printf '%s-Blaze-Stable\n' "$out"
+          printf -- '-BLAZE-STABLE\n'
           SETLOCALVERSION_EOF
           chmod +x scripts/setlocalversion
 
@@ -504,48 +386,6 @@ jobs:
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
 
-      - name: Verify final configs
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          CFG=$(find out -name ".config" | head -n1)
-          [ -n "$CFG" ]
-          echo "--- Core KSU / namespace configs ---"
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_KPROBES CONFIG_KSU CONFIG_KSU_SUSFS; do
-            if grep -q "^${SYM}=y$" "$CFG"; then
-              echo "OK: ${SYM}=y"
-            else
-              echo "WARNING: ${SYM} not enabled"
-            fi
-          done
-          echo "--- Custom device/hardware configs (informational — kernel's own dependency resolution (olddefconfig) may silently drop some of these if a dependency is unmet, that is normal and not a build error) ---"
-          for SYM in CONFIG_CAN CONFIG_IIO_CONFIGFS CONFIG_PCI_ENDPOINT_CONFIGFS CONFIG_RTL8XXXU CONFIG_WLAN CONFIG_CFG80211 CONFIG_MAC80211; do
-            if grep -q "^${SYM}=y$" "$CFG"; then
-              echo "OK: ${SYM}=y"
-            else
-              echo "INFO: ${SYM} not present in final .config (dropped by dependency resolution or not applicable to this arch/branch)"
-            fi
-          done
-          if [ "${{ github.event.inputs.enable_usb_gadget_configs }}" = "true" ]; then
-            echo "--- USB Gadget/ConfigFS configs (opt-in, advanced) ---"
-            for SYM in CONFIG_USB_GADGET CONFIG_USB_CONFIGFS; do
-              if grep -q "^${SYM}=y$" "$CFG"; then
-                echo "OK: ${SYM}=y"
-              else
-                echo "INFO: ${SYM} not present in final .config"
-              fi
-            done
-            for SYM in CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS_ECM_SUBSET CONFIG_USB_F_HID CONFIG_HID_GADGET; do
-              if grep -q "^${SYM}=m$" "$CFG"; then
-                echo "OK: ${SYM}=m (module, not forced built-in)"
-              else
-                echo "INFO: ${SYM} not present as module in final .config"
-              fi
-            done
-          else
-            echo "--- USB Gadget/ConfigFS configs skipped (enable_usb_gadget_configs=false) ---"
-          fi
-
       - name: Locate built Image
         working-directory: kernel_workspace
         run: |
@@ -555,10 +395,10 @@ jobs:
             IMG=$(find out -name "Image" | head -n1)
           fi
           if [ -z "$IMG" ]; then
-            echo "::error::No kernel Image found — build failed"
+            echo "::error::No kernel Image found anywhere under kernel_workspace/out — build failed above"
             exit 1
           fi
-          echo "Found Image: $IMG"
+          echo "Found Image at: $IMG"
           echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
 
       - name: Package AnyKernel3
@@ -567,43 +407,11 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-${{ github.event.inputs.ksu_variant }}-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
-
-      - name: Download Manager APK (best-effort, never fails the build)
-        run: |
-          set +e
-          case "${{ github.event.inputs.ksu_variant }}" in
-            mambosu)
-              MGR_REPO="RapliVx/KernelSU"
-              ;;
-            resukisu)
-              MGR_REPO="ReSukiSU/ReSukiSU"
-              ;;
-            *)
-              MGR_REPO=""
-              ;;
-          esac
-          if [ -n "$MGR_REPO" ]; then
-            echo "Looking up latest manager release from ${MGR_REPO}..."
-            ASSET_URL=$(curl -s "https://api.github.com/repos/${MGR_REPO}/releases/latest" \
-              | grep -oE '"browser_download_url": *"[^"]*\.apk"' \
-              | head -n1 \
-              | sed -E 's/"browser_download_url": *"([^"]*)"/\1/')
-            if [ -n "$ASSET_URL" ]; then
-              echo "Found manager APK: $ASSET_URL"
-              curl -LSs -o "manager-${{ github.event.inputs.ksu_variant }}.apk" "$ASSET_URL" \
-                && echo "✓ Manager APK downloaded"
-            else
-              echo "::warning::No .apk release asset found for ${MGR_REPO}; skipping manager bundling. Build continues normally."
-            fi
-          fi
-          exit 0
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-resukisu-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.device_name }}-build
-          path: |
-            *.zip
-            *.apk
+          path: "*.zip"
           retention-days: 14
