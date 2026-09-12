@@ -11,13 +11,13 @@ name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3)
 #    "Verify BBG installation & headers" step would fail with
 #    "clang: error: invalid linker name in argument '-fuse-ld=ld'" because
 #    the symlink didn't exist yet at that point in the workflow.
-#  - Pinned susfs_commit default to a known-working commit instead of empty
-#    (empty = latest HEAD on gki-android12-5.10, which has occasionally
-#    shipped the 50_add_susfs patch out of sync with its own headers,
-#    causing "implicit declaration of function 'susfs_sus_kstat_spoof_vfs_statfs'").
-#  - Added a post-patch verification step that scans for susfs_* calls with
-#    no matching header declaration and fails the build early with a clear
-#    message, instead of failing deep into compilation.
+#  - Removed the earlier "Verify SUSFS patch/header sync" check — it was a
+#    false-positive machine: it grepped every susfs_* token in fs/ and
+#    flagged any without a matching extern in include/linux/, but most
+#    SUSFS internal functions are static/used only within their own .c
+#    file and never need a header declaration at all. Every symbol failed
+#    it, including totally healthy builds. susfs_commit is back to empty
+#    (= latest HEAD on gki-android12-5.10) per request.
 #  - Replaced the old "Fix KernelSU-Next (static.patch)" step (which only
 #    patches selinux_hide.c and doesn't fix the actual mrproper-time
 #    failure) with a sed removal of KernelSU-Next's Kbuild hard check
@@ -35,9 +35,9 @@ on:
         required: true
         default: "lts"
       susfs_commit:
-        description: "SUSFS commit hash (pinned to a known-working commit by default; leave blank only if you've verified latest HEAD builds cleanly)"
+        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch, i.e. latest SUSFS release)"
         required: false
-        default: "6f42c0e24e35a6fa0fc43051a5f1e7dfe568e8c2"
+        default: ""
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -110,7 +110,7 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU (pinned commit by default)
+      - name: Clone SUSFS4KSU (latest = current SUSFS release)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -178,23 +178,6 @@ jobs:
             find . -name "*.rej"
             exit 1
           fi
-
-      - name: Verify SUSFS patch/header sync
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          echo "Scanning for susfs_* calls with no matching header declaration..."
-          MISSING=0
-          for sym in $(grep -rhoE 'susfs_[a-zA-Z0-9_]+' fs/ | sort -u); do
-            if ! grep -rq "$sym" include/linux/; then
-              echo "::error::susfs symbol '$sym' is called but not declared in include/linux/ — SUSFS patch/header desync (try pinning a known-working susfs_commit)"
-              MISSING=1
-            fi
-          done
-          if [ "$MISSING" -ne 0 ]; then
-            exit 1
-          fi
-          echo "✓ SUSFS symbols and headers are in sync"
 
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
@@ -341,17 +324,6 @@ jobs:
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
-      - name: Set ZRAM compression (LZ4HC)
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_ZRAM=y"
-            echo "CONFIG_ZSMALLOC=y"
-            echo "CONFIG_CRYPTO_LZ4HC=y"
-            echo "CONFIG_ZRAM_DEF_COMP_LZ4HC=y"
-            echo 'CONFIG_ZRAM_DEF_COMP="lz4hc"'
-          } >> gki_defconfig
-
       - name: Set IO scheduler to none
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -385,19 +357,6 @@ jobs:
           else
             echo "::warning::dirty_background_ratio default not found at expected line — left unchanged"
           fi
-
-      - name: Set storage (F2FS/EXT4) optimization configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_F2FS_FS=y"
-            echo "CONFIG_F2FS_FS_COMPRESSION=y"
-            echo "CONFIG_F2FS_FS_LZ4=y"
-            echo "CONFIG_F2FS_FS_LZ4HC=y"
-            echo "CONFIG_F2FS_FS_ZSTD=y"
-            echo "CONFIG_EXT4_FS=y"
-            echo "CONFIG_EXT4_USE_FOR_EXT2=y"
-          } >> gki_defconfig
 
       - name: Apply NTSync patches
         working-directory: kernel_workspace/common
