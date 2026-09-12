@@ -70,6 +70,23 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
+      # NOTE: this patch is required even under ReSukiSU. ReSukiSU's "SuSFS Inline
+      # Hook" mode (auto-selected once CONFIG_KSU_SUSFS=y is set) needs the syscall
+      # call-sites (ksu_handle_setresuid, ksu_handle_execveat, etc.) that only this
+      # patch inserts — without it, drivers/kernelsu's own inline_hook_check.mk fails
+      # the build with "You lost ksu_handle_setresuid hook in your kernel".
+      - name: Clone SUSFS4KSU (ShirkNeko fork — gki-android12-5.10, provides syscall hook wiring)
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
+          cd susfs4ksu
+          if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
+            git checkout "${{ github.event.inputs.susfs_commit }}"
+          fi
+          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
+
       - name: Set SUSFS kernel configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -90,6 +107,13 @@ jobs:
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUD=y"
           } >> gki_defconfig
 
+      - name: Copy SUSFS kernel patches
+        run: |
+          cd kernel_workspace/common
+          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
+
       - name: Apply android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
         run: |
@@ -101,6 +125,35 @@ jobs:
             sed -i '/^[[:space:]]*\/\*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
             perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
+          fi
+
+      - name: Apply SUSFS kernel patch
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
+            echo "::error::SUSFS patch failed to apply cleanly — .rej files below:"
+            find . -name "*.rej"
+            exit 1
+          fi
+
+      # NOTE: this is the surgical fix for the earlier "implicit declaration of
+      # function 'susfs_sus_kstat_spoof_vfs_statfs'" build error. ReSukiSU already
+      # implements its own kstat/stat spoofing via its inline hook (visible in the
+      # build log as "ksu_handle_stat found"), so the susfs4ksu patch's edit to
+      # fs/statfs.c calling that symbol is both redundant and — because ReSukiSU's
+      # own SUSFS header/wiring doesn't declare it under this build — undefined.
+      # Every OTHER hook call site the patch inserts (setresuid, execveat, etc.) is
+      # still required and is left untouched.
+      - name: Remove redundant statfs kstat-spoof call (ReSukiSU already hooks stat)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
+            sed -i '/if (!susfs_sus_kstat_spoof_vfs_statfs(d_backing_inode(dentry), buf, is_fuse))/,+1d' fs/statfs.c
+            echo "Removed redundant susfs_sus_kstat_spoof_vfs_statfs() call from fs/statfs.c"
+          else
+            echo "No redundant statfs kstat-spoof call found — nothing to strip"
           fi
 
       - name: Fix SUSFS set_nameidata argument mismatch
@@ -129,20 +182,13 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup ReSukiSU (default tracepoint hook — GKI2 5.10+, manual SUSFS integration above)
+      - name: Setup ReSukiSU (default hook mode — SUSFS forces SuSFS Inline Hook)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
           echo "Contents after ReSukiSU setup (verify the KernelSU dir name below matches what later steps expect):"
           ls -d KernelSU* 2>/dev/null || echo "::warning::no KernelSU* directory found — check setup.sh output above for the actual path it created"
-
-      # NOTE: ReSukiSU's default setup.sh uses the tracepoint syscall-redirect hook,
-      # which is only supported on GKI2 (5.10+) kernels with arm64-v8a/x86_64 — that
-      # matches this workflow's android12-5.10 target, so no CONFIG_KSU_MANUAL_HOOK
-      # is needed here. If you retarget this workflow at an older/non-GKI kernel,
-      # add CONFIG_KSU_MANUAL_HOOK=y to gki_defconfig and re-check ReSukiSU's manual
-      # hook integration docs, since the tracepoint hook won't work there.
 
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
