@@ -70,18 +70,6 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU (ShirkNeko fork — gki-android12-5.10, compatible with ReSukiSU)
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
-          cd susfs4ksu
-          if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
-            git checkout "${{ github.event.inputs.susfs_commit }}"
-          fi
-          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
-
       - name: Set SUSFS kernel configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -102,13 +90,6 @@ jobs:
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUD=y"
           } >> gki_defconfig
 
-      - name: Copy SUSFS kernel patches
-        run: |
-          cd kernel_workspace/common
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
-
       - name: Apply android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
         run: |
@@ -120,16 +101,6 @@ jobs:
             sed -i '/^[[:space:]]*\/\*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
             perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
-          fi
-
-      - name: Apply SUSFS kernel patch
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
-            echo "::error::SUSFS patch failed to apply cleanly — .rej files below:"
-            find . -name "*.rej"
-            exit 1
           fi
 
       - name: Fix SUSFS set_nameidata argument mismatch
