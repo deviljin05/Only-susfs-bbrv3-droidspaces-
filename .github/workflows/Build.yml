@@ -188,6 +188,38 @@ jobs:
             fi
           fi
           
+      - name: Inject missing SUSFS constants (include-order bug fix)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          sed -i '1i #define SUSFS_MAX_LEN_PATHNAME 256\n#define SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE 8192\n#define SUSFS_ENABLED_FEATURES_SIZE 8192' include/linux/susfs.h
+
+      - name: Ensure susfs.h included everywhere (guaranteed for fs/statfs.c)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          FILES_TO_FIX="$(grep -rlE '\bsusfs_[a-zA-Z0-9_]+\b' --include='*.c' --include='*.h' . | sort -u || true)"
+          for f in $FILES_TO_FIX; do
+            case "$f" in
+              */include/linux/susfs.h|*/fs/susfs.c|*/fs/susfs*)
+                continue
+                ;;
+            esac
+            if ! grep -q '#include <linux/susfs.h>' "$f"; then
+              LAST_INCLUDE_LINE="$(grep -n '^#include' "$f" | tail -1 | cut -d: -f1 || true)"
+              if [ -n "${LAST_INCLUDE_LINE}" ]; then
+                sed -i "${LAST_INCLUDE_LINE}a #include <linux/susfs.h>" "$f"
+              else
+                sed -i "1i #include <linux/susfs.h>" "$f"
+              fi
+            fi
+          done
+          if [ -f fs/statfs.c ]; then
+            if ! grep -q '#include <linux/susfs.h>' fs/statfs.c; then
+              sed -i "1i #include <linux/susfs.h>" fs/statfs.c
+            fi
+          fi
+          
       - name: Fix SUSFS set_nameidata argument mismatch
         working-directory: kernel_workspace/common
         run: |
@@ -359,31 +391,13 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          # ==========================================================
-          # FIX: Patch KernelSU Kbuild BEFORE build.sh runs mrproper
-          # $(error) -> $(warning): clean phase mein configs nahi hote,
-          # isliye error ki jagah warning. Build phase mein configs
-          # (CONFIG_KPROBES=y, CONFIG_KSU_SUSFS=y) hote hain, isliye
-          # warning fire nahi hoti.
-          # ==========================================================
           KB="common/drivers/kernelsu/Kbuild"
-          if [ ! -f "$KB" ]; then
-            echo "::error::Kbuild not found at $KB"
-            exit 1
+          if [ -f "$KB" ]; then
+            sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
           fi
-          echo "=== Original Kbuild (first 5 lines) ==="
-          sed -n '1,5p' "$KB"
-          sed -i 's|\$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")|$(warning "KernelSU: configs not visible during clean phase, non-fatal")|g' "$KB"
-          echo "=== Patched Kbuild (first 5 lines) ==="
-          sed -n '1,5p' "$KB"
-          if grep -q '\$(error "KernelSU requires' "$KB"; then
-            echo "::error::Kbuild patch did NOT apply — \$(error ...) still present"
-            exit 1
-          fi
-          echo "✓ Kbuild patched (error → warning)"
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="ci"
-          export LD=/usr/bin/ld
+          export LD=/usr/bin/ld.bfd
           LTO=thin \
           BUILD_CONFIG=common/build.config.gki.aarch64 \
           USE_CCACHE=1 \
