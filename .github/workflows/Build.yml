@@ -120,33 +120,35 @@ jobs:
           echo "Found libgcc_s.so.1 in: ${LIBGCC_PATH}"
           echo "LIBGCC_PATH=${LIBGCC_PATH}" >> "$GITHUB_ENV"
 
-      - name: Symlink ld into Android prebuilt clang path
+      - name: Override ld.lld with system ld.bfd (all toolchain copies)
         working-directory: kernel_workspace
         run: |
-          set -euo pipefail
-          CLANG_BIN=""
-          for base in prebuilts-master/clang/host/linux-x86 prebuilts/clang/host/linux-x86; do
-            if [ -d "${base}" ]; then
-              FOUND="$(find "${base}" -maxdepth 3 -name 'clang-12' -type f 2>/dev/null | head -n1)"
-              if [ -n "${FOUND}" ]; then
-                CLANG_BIN="$(dirname "${FOUND}")"
-                break
-              fi
-            fi
-          done
-          if [ -z "${CLANG_BIN}" ]; then
-            echo "::error::Could not locate Android prebuilt clang-12 directory"
-            exit 1
-          fi
-          echo "Clang bin directory: ${CLANG_BIN}"
-          if [ -x /usr/bin/ld.bfd ]; then
-            ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld.lld"
-            ln -sf /usr/bin/ld.bfd "${CLANG_BIN}/ld"
-            echo "✓ Overrode ld.lld and ld with /usr/bin/ld.bfd"
-          else
+          set -uo pipefail
+          if [ ! -x /usr/bin/ld.bfd ]; then
             echo "::error::/usr/bin/ld.bfd not found"
             exit 1
           fi
+          FOUND_ANY=0
+          # Find every ld.lld under any prebuilt clang toolchain directory — this does not
+          # depend on a specific version name (e.g. clang-12 vs clang-r416183b), which breaks
+          # every time Google bumps the toolchain on the rolling 'lts' branch. ld.lld itself
+          # may be a symlink, so match both regular files and symlinks.
+          for base in prebuilts-master prebuilts; do
+            if [ -d "${base}" ]; then
+              while IFS= read -r -d '' LD_LLD_PATH; do
+                DIR="$(dirname "${LD_LLD_PATH}")"
+                echo "Overriding ld.lld in: ${DIR}"
+                ln -sf /usr/bin/ld.bfd "${DIR}/ld.lld"
+                ln -sf /usr/bin/ld.bfd "${DIR}/ld"
+                FOUND_ANY=1
+              done < <(find "${base}" -maxdepth 6 \( -type f -o -type l \) -name 'ld.lld' -print0 2>/dev/null)
+            fi
+          done
+          if [ "${FOUND_ANY}" -eq 0 ]; then
+            echo "::error::Could not find any ld.lld under prebuilts-master/ or prebuilts/ to override"
+            exit 1
+          fi
+          echo "✓ ld.lld/ld overridden with /usr/bin/ld.bfd in every toolchain copy found"
 
       - name: Clone KSU driver source (${{ github.event.inputs.ksu_variant }})
         working-directory: kernel_workspace
