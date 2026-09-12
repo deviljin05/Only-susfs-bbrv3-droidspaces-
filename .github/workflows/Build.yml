@@ -359,9 +359,6 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          # ==========================================================
-          # FIX: Patch KernelSU Kbuild BEFORE build.sh runs mrproper
-          # ==========================================================
           KB="common/drivers/kernelsu/Kbuild"
           if [ ! -f "$KB" ]; then
             echo "::error::Kbuild not found at $KB"
@@ -385,7 +382,7 @@ jobs:
           USE_CCACHE=1 \
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
-
+          
       - name: Verify final configs
         working-directory: kernel_workspace
         run: |
