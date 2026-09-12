@@ -151,11 +151,13 @@ jobs:
           set -euo pipefail
           if grep -q 'susfs_sus_kstat_spoof_vfs_statfs' fs/statfs.c; then
             sed -i '/if (!susfs_sus_kstat_spoof_vfs_statfs(d_backing_inode(dentry), buf, is_fuse))/,+1d' fs/statfs.c
-            # The two lines above were the only thing that ever jumped to this
-            # label — deleting them leaves it orphaned, and -Werror fails the
-            # build on the resulting unused-label warning. Strip the label too.
-            sed -i '/^bypass_orig_flow:$/d' fs/statfs.c
-            echo "Removed redundant susfs_sus_kstat_spoof_vfs_statfs() call and its now-orphaned label from fs/statfs.c"
+            # NOTE: do NOT delete the 'bypass_orig_flow:' label itself — it is
+            # also the target of at least one other goto elsewhere in this file
+            # (confirmed by a later build failing with "undeclared label
+            # 'bypass_orig_flow'" once the label was removed). Only the two
+            # lines that called the undefined kstat-spoof symbol are stripped;
+            # the label stays so every other jump to it still resolves.
+            echo "Removed redundant susfs_sus_kstat_spoof_vfs_statfs() call from fs/statfs.c (label left intact — still used elsewhere)"
           else
             echo "No redundant statfs kstat-spoof call found — nothing to strip"
           fi
